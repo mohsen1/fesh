@@ -1,6 +1,6 @@
 use byteorder::{ByteOrder, LittleEndian};
 use iced_x86::{Decoder, DecoderOptions};
-use object::{Architecture, Object, ObjectSection, SectionKind};
+use object::{Architecture, Object, ObjectSection, ObjectSegment, SectionKind};
 use rayon::prelude::*;
 use std::fs;
 use std::io::{Read, Write};
@@ -23,9 +23,10 @@ const CAT_S24: u8 = 10;
 const CAT_RELA24: u8 = 11;
 const CAT_SYM24: u8 = 12;
 const CAT_EH: u8 = 13;
-const CAT_COUNT: usize = 14;
+const CAT_JT4: u8 = 14;
+const CAT_COUNT: usize = 15;
 
-const XZ_CHECK: Check = Check::Crc64;
+const XZ_CHECK: Check = Check::None;
 const PRESET_EXTREME: u32 = 1u32 << 31;
 
 fn choose_pb(cat: usize) -> u32 {
@@ -139,6 +140,7 @@ fn bswap_u64_array(data: &mut [u8]) {
 fn bswap_cat(data: &mut [u8], cat: usize) {
     match cat {
         c if c == CAT_S4 as usize => bswap_u32_array(data),
+        c if c == CAT_JT4 as usize => bswap_u32_array(data),
         c if c == CAT_S8 as usize => bswap_u64_array(data),
         c if c == CAT_RELR8 as usize => bswap_u64_array(data),
         c if c == CAT_S16 as usize => {
@@ -429,14 +431,21 @@ struct JumpTable {
     count: usize,
 }
 
-fn process_jump_tables(file_data: &[u8], is_compress: bool, use_be: bool, jt_meta_in: Option<&[u8]>) -> Result<(Vec<u8>, Vec<u8>), String> {
+fn process_jump_tables(file_data: &[u8], is_compress: bool, use_be: bool, jt_meta_in: Option<&[u8]>) -> Result<(Vec<u8>, Vec<u8>, Vec<JumpTable>), String> {
     let mut out = file_data.to_vec();
     let obj = match object::File::parse(file_data) {
         Ok(o) => o,
-        Err(_) => return Ok((out, Vec::new())),
+        Err(_) => return Ok((out, Vec::new(), Vec::new())),
     };
 
-    if obj.architecture() != Architecture::X86_64 { return Ok((out, Vec::new())); }
+    if obj.architecture() != Architecture::X86_64 { return Ok((out, Vec::new(), Vec::new())); }
+
+    let mut image_base = u64::MAX;
+    for sec in obj.segments() {
+        if sec.address() < image_base { image_base = sec.address(); }
+    }
+    if image_base == u64::MAX { image_base = 0; }
+
 
     let mut text_va = 0u64;
     let mut text_size = 0u64;
@@ -448,7 +457,7 @@ fn process_jump_tables(file_data: &[u8], is_compress: bool, use_be: bool, jt_met
         }
     }
 
-    if text_size == 0 { return Ok((out, Vec::new())); }
+    if text_size == 0 { return Ok((out, Vec::new(), Vec::new())); }
 
     let mut tables = Vec::new();
 
@@ -484,7 +493,7 @@ fn process_jump_tables(file_data: &[u8], is_compress: bool, use_be: bool, jt_met
         let mut pos = 0;
         let num_tables = match read_varint(meta, &mut pos) {
             Ok(v) => v as usize,
-            Err(_) => return Ok((out, Vec::new())), 
+            Err(_) => return Ok((out, Vec::new(), Vec::new())), 
         };
         
         let mut prev_fo = 0;
@@ -517,29 +526,41 @@ fn process_jump_tables(file_data: &[u8], is_compress: bool, use_be: bool, jt_met
         None
     };
 
-    for t in tables {
+    for t in &tables {
         for i in 0..t.count {
             let p = t.fo + (i * 4);
             let entry_va = file_to_va(p as u64).unwrap_or(0);
             
             if is_compress {
                 let val = LittleEndian::read_i32(&out[p..p+4]);
-                let target_va = entry_va.wrapping_add(val as i64 as u64) as u32;
+                let target_va = entry_va.wrapping_add(val as i64 as u64).wrapping_sub(image_base) as u32;
                 if use_be { out[p..p+4].copy_from_slice(&target_va.to_be_bytes()); } 
                 else { out[p..p+4].copy_from_slice(&target_va.to_le_bytes()); }
             } else {
                 let target_va = if use_be { u32::from_be_bytes(out[p..p+4].try_into().unwrap()) } 
                 else { LittleEndian::read_u32(&out[p..p+4]) };
-                let orig_rel = (target_va as u64).wrapping_sub(entry_va) as u32;
+                let orig_rel = (target_va as u64).wrapping_add(image_base).wrapping_sub(entry_va) as u32;
                 LittleEndian::write_u32(&mut out[p..p+4], orig_rel);
             }
         }
     }
 
-    Ok((out, meta_out))
+    Ok((out, meta_out, tables))
 }
 
 // ---------------- EH Frame PC-Rel Normalization ----------------
+
+
+fn eh_pe_fixed_size(enc: u8, ptr_size: usize) -> Option<usize> {
+    if enc == 0xFF { return Some(0); } // DW_EH_PE_omit
+    match enc & 0x0F {
+        0x00 => Some(ptr_size),      
+        0x02 | 0x0A => Some(2),      
+        0x03 | 0x0B => Some(4),      
+        0x04 | 0x0C => Some(8),      
+        _ => None,                   
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 struct EhPatch {
@@ -553,6 +574,12 @@ fn process_eh_frame_hdr(file_data: &[u8], is_compress: bool, use_be: bool) -> Ve
         Ok(o) => o,
         Err(_) => return out,
     };
+    
+    let mut image_base = u64::MAX;
+    for sec in obj.segments() {
+        if sec.address() < image_base { image_base = sec.address(); }
+    }
+    if image_base == u64::MAX { image_base = 0; }
 
     let mut patches = Vec::new();
 
@@ -573,22 +600,22 @@ fn process_eh_frame_hdr(file_data: &[u8], is_compress: bool, use_be: bool) -> Ve
         if table_enc != 0x1b && table_enc != 0x3b { continue; }
 
         let mut pos = 4;
-        let skip_enc = |enc: u8, p: &mut usize| {
-            if enc == 0xff { return; } 
-            let format = enc & 0x0f;
-            match format {
-                0x02 | 0x0a | 0x0b => *p += 2, 
-                0x03 | 0x0c => *p += 4, 
-                0x04 | 0x0d => *p += 8, 
-                _ => *p += 4, 
-            }
+        let skip_sz = match eh_pe_fixed_size(eh_frame_ptr_enc, 8) {
+            Some(sz) => sz,
+            None => continue,
         };
-
-        skip_enc(eh_frame_ptr_enc, &mut pos);
+        pos += skip_sz;
         
-        if fde_count_enc == 0x03 || fde_count_enc == 0x0b {
+        let fde_count_sz = match eh_pe_fixed_size(fde_count_enc, 8) {
+            Some(sz) => sz,
+            None => continue,
+        };
+        
+        if fde_count_sz == 4 {
+            if pos + 4 > data.len() { continue; }
             let fde_count = LittleEndian::read_u32(&data[pos..pos+4]) as usize;
             pos += 4;
+            
             let table_bytes = fde_count * 8;
             if pos + table_bytes <= data.len() {
                 for i in 0..(fde_count * 2) {
@@ -604,13 +631,16 @@ fn process_eh_frame_hdr(file_data: &[u8], is_compress: bool, use_be: bool) -> Ve
     for p in patches {
         if is_compress {
             let cur_rel = LittleEndian::read_i32(&out[p.fo..p.fo + 4]);
-            let abs_va = p.field_va.wrapping_add(cur_rel as i64 as u64) as u32;
-            if use_be { out[p.fo..p.fo + 4].copy_from_slice(&abs_va.to_be_bytes()); } 
-            else { out[p.fo..p.fo + 4].copy_from_slice(&abs_va.to_le_bytes()); }
+            let mut abs_va = p.field_va.wrapping_add(cur_rel as i64 as u64);
+            if abs_va >= image_base { abs_va -= image_base; }
+            if abs_va > u32::MAX as u64 { continue; }
+            let abs_va32 = abs_va as u32;
+            if use_be { out[p.fo..p.fo + 4].copy_from_slice(&abs_va32.to_be_bytes()); } 
+            else { out[p.fo..p.fo + 4].copy_from_slice(&abs_va32.to_le_bytes()); }
         } else {
-            let abs_va = if use_be { u32::from_be_bytes(out[p.fo..p.fo + 4].try_into().unwrap()) } 
+            let abs_va32 = if use_be { u32::from_be_bytes(out[p.fo..p.fo + 4].try_into().unwrap()) } 
             else { LittleEndian::read_u32(&out[p.fo..p.fo + 4]) };
-            let orig_rel = (abs_va as u64).wrapping_sub(p.field_va) as u32;
+            let orig_rel = (abs_va32 as u64).wrapping_add(image_base).wrapping_sub(p.field_va) as u32;
             LittleEndian::write_u32(&mut out[p.fo..p.fo + 4], orig_rel);
         }
     }
@@ -629,6 +659,11 @@ struct Patch {
 fn process_binary(file_data: &[u8], is_compress: bool, use_be: bool) -> Vec<u8> {
     let mut skel = file_data.to_vec();
     let obj = match object::File::parse(file_data) { Ok(o) => o, Err(_) => return skel };
+    let mut image_base = u64::MAX;
+    for sec in obj.segments() {
+        if sec.address() < image_base { image_base = sec.address(); }
+    }
+    if image_base == u64::MAX { image_base = 0; }
     if obj.architecture() != Architecture::X86_64 || !obj.is_little_endian() || !obj.is_64() { return skel; }
 
     let mut patches: Vec<Patch> = Vec::new();
@@ -674,11 +709,13 @@ fn process_binary(file_data: &[u8], is_compress: bool, use_be: bool) -> Vec<u8> 
         if is_compress {
             let cur = LittleEndian::read_u32(&skel[p.fo..p.fo + 4]);
             let dest = cur.wrapping_add(p.next_ip);
-            if use_be { skel[p.fo..p.fo + 4].copy_from_slice(&dest.to_be_bytes()); } 
-            else { skel[p.fo..p.fo + 4].copy_from_slice(&dest.to_le_bytes()); }
+            let norm = dest.wrapping_sub(image_base as u32);
+            if use_be { skel[p.fo..p.fo + 4].copy_from_slice(&norm.to_be_bytes()); } 
+            else { skel[p.fo..p.fo + 4].copy_from_slice(&norm.to_le_bytes()); }
         } else {
-            let dest = if use_be { u32::from_be_bytes(skel[p.fo..p.fo + 4].try_into().unwrap()) } 
+            let norm = if use_be { u32::from_be_bytes(skel[p.fo..p.fo + 4].try_into().unwrap()) } 
             else { LittleEndian::read_u32(&skel[p.fo..p.fo + 4]) };
+            let dest = norm.wrapping_add(image_base as u32);
             let orig = dest.wrapping_sub(p.next_ip);
             LittleEndian::write_u32(&mut skel[p.fo..p.fo + 4], orig);
         }
@@ -689,7 +726,7 @@ fn process_binary(file_data: &[u8], is_compress: bool, use_be: bool) -> Vec<u8> 
 
 // ---------------- Routing ----------------
 
-fn split_streams(file_data: &[u8]) -> (Vec<u8>, Vec<Vec<u8>>) {
+fn split_streams(file_data: &[u8], jump_tables: &[JumpTable]) -> (Vec<u8>, Vec<Vec<u8>>) {
     let mut labels = vec![CAT_OTHER; file_data.len()];
     let ptr_prefixes = [".got", ".got.plt", ".data.rel.ro", ".init_array", ".fini_array", ".plt.got"];
 
@@ -733,6 +770,11 @@ fn split_streams(file_data: &[u8]) -> (Vec<u8>, Vec<Vec<u8>>) {
         }
     }
 
+    for t in jump_tables {
+        for i in t.fo .. t.fo + (t.count * 4) {
+            if i < labels.len() { labels[i] = CAT_JT4; }
+        }
+    }
     let mut runs = Vec::new();
     if !labels.is_empty() {
         let mut cur_cat = labels[0];
@@ -756,16 +798,17 @@ fn split_streams(file_data: &[u8]) -> (Vec<u8>, Vec<Vec<u8>>) {
 fn compress_with_mode(file_data: &[u8], use_be: bool) -> Vec<u8> {
     let skel = process_binary(file_data, true, use_be);
     let skel = process_eh_frame_hdr(&skel, true, use_be);
-    let (skel, jt_meta) = process_jump_tables(&skel, true, use_be, None).unwrap();
+    let (skel, jt_meta, jump_tables) = process_jump_tables(&skel, true, use_be, None).unwrap();
     let skel = process_elf_tables(&skel, true);
     
-    let (runs, mut streams) = split_streams(&skel);
+    let (runs, mut streams) = split_streams(&skel, &jump_tables);
 
     let preset = 9 | PRESET_EXTREME;
     let strides = [
         (CAT_S2, 2usize), (CAT_S4, 4usize), (CAT_S8, 8usize), (CAT_RELR8, 8usize),
         (CAT_S16, 16usize), (CAT_REL16, 16usize), (CAT_DYNAMIC16, 16usize), 
-        (CAT_S24, 24usize), (CAT_RELA24, 24usize), (CAT_SYM24, 24usize)
+        (CAT_S24, 24usize), (CAT_RELA24, 24usize), (CAT_SYM24, 24usize),
+        (CAT_JT4, 4usize)
     ];
     for (cat, stride) in strides {
         let s = &mut streams[cat as usize];
@@ -774,6 +817,7 @@ fn compress_with_mode(file_data: &[u8], use_be: bool) -> Vec<u8> {
     }
 
     let compressed_streams: Vec<Vec<u8>> = streams.par_iter().enumerate().map(|(cat, s)| {
+        if s.is_empty() { return vec![]; }
         let pb = choose_pb(cat);
         let dict = choose_dict_size(s.len());
         
@@ -858,7 +902,8 @@ fn decompress(data: &[u8]) -> Result<Vec<u8>, String> {
     let strides = [
         (CAT_S2, 2usize), (CAT_S4, 4usize), (CAT_S8, 8usize), (CAT_RELR8, 8usize),
         (CAT_S16, 16usize), (CAT_REL16, 16usize), (CAT_DYNAMIC16, 16usize), 
-        (CAT_S24, 24usize), (CAT_RELA24, 24usize), (CAT_SYM24, 24usize)
+        (CAT_S24, 24usize), (CAT_RELA24, 24usize), (CAT_SYM24, 24usize),
+        (CAT_JT4, 4usize)
     ];
     for (cat, stride) in strides {
         let s = &mut decompressed_streams[cat as usize];
@@ -893,7 +938,7 @@ fn decompress(data: &[u8]) -> Result<Vec<u8>, String> {
     }
 
     let skel = process_elf_tables(&skel, false);
-    let (skel, _) = process_jump_tables(&skel, false, use_be, Some(jt_meta))?;
+    let (skel, _, _) = process_jump_tables(&skel, false, use_be, Some(jt_meta))?;
     let skel = process_eh_frame_hdr(&skel, false, use_be);
     Ok(process_binary(&skel, false, use_be))
 }
@@ -915,7 +960,7 @@ fn main() {
             let d_time = start.elapsed();
             assert_eq!(data, decompressed, "Mismatch!");
 
-            println!("====== FESH USASE vC (EH_FRAME_HDR + Jump Tables + LC0 MoE) ======");
+            println!("====== FESH USASE vE (EH_FRAME_HDR + Jump Tables + LC0 MoE) ======");
             println!("Target File: {}", path);
             println!("Input:       {} bytes", data.len());
             let ratio = (compressed.len() as f64 / data.len() as f64) * 100.0;
