@@ -168,10 +168,8 @@ jobs:
             elif size_bytes < 1024 * 1024: return f"{size_bytes / 1024:.1f}KB"
             else: return f"{size_bytes / (1024 * 1024):.2f}MB"
 
-        table = "| Target | Orig | GZIP | Brotli | ZSTD | XZ BCJ | **FESH** | **Gain** |
-"
-        table += "|:---|---:|---:|---:|---:|---:|---:|---:|
-"
+        table = "| Target | Orig | GZIP | Brotli | ZSTD | XZ BCJ | **FESH** | **Gain** |\n"
+        table += "|:---|---:|---:|---:|---:|---:|---:|---:|\n"
 
         fesh_wins = 0
         total = len(results)
@@ -200,7 +198,6 @@ jobs:
                 return f"**{s}**" if name == winner_name else s
 
             table += f"| `{r['name']}` | {format_size(orig)} | {fmt_col(gz, 'GZIP')} | {fmt_col(br, 'Brotli')} | {fmt_col(zst, 'ZSTD')} | {fmt_col(bcj, 'XZ BCJ')} | {fmt_col(fesh, 'FESH')} | {gain} |\n"
-"
 
         mean_gain = total_fesh_gain_pct / total if total > 0 else 0.0
 
