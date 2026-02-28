@@ -242,11 +242,15 @@ jobs:
         Every single benchmark strictly enforces decompression validation to mathematically prove exact artifact reproduction bit-by-bit!
         
         FESH won **{fesh_wins} out of {total}** benchmarks, establishing a new state-of-the-art compression ceiling for executable artifacts globally.
-        
-        {table}
+
+        Full benchmark details are in [BENCHMARK.md](BENCHMARK.md).
         
         *(Note: Tiny binaries under 50KB were excluded as container headers dominate small files. FESH executes native compression transparently within ~150ms per binary via Rayon).*
         """
+
+        with open("BENCHMARK.md", "w") as f:
+            f.write("# FESH Benchmark Results\n\n")
+            f.write(table)
 
         with open("README.md", "w") as f:
             f.write(readme)
@@ -259,6 +263,6 @@ jobs:
       run: |
         git config --global user.name "GitHub Actions"
         git config --global user.email "actions@github.com"
-        git add README.md
+        git add README.md BENCHMARK.md
         git commit -m "docs: auto-update benchmarks table from CI" || exit 0
         git push
