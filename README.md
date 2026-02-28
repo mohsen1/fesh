@@ -1,5 +1,5 @@
 # FESH (Fast ELF Semantic Heuristics)
-> 🚀 **FESH is on average 6.0% more efficient than `xz -9e --x86` (XZ BCJ) across the top 100 Linux distribution packages.**
+> 🚀 **FESH is on average 6.2% more efficient than `xz -9e --x86` (XZ BCJ) across the top 100 Linux distribution packages.**
 
 FESH is a specialized compression pre-processor for x86_64 ELF binaries. It leverages native binary structure to vastly improve traditional LZMA (XZ) dictionary chains.
 
