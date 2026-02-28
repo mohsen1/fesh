@@ -26,7 +26,8 @@ const CAT_RELA24: u8 = 11;
 const CAT_SYM24: u8 = 12;
 const CAT_EH: u8 = 13;
 const CAT_JT4: u8 = 14;
-const CAT_COUNT: usize = 15;
+const CAT_GNUHASH: u8 = 15;
+const CAT_COUNT: usize = 16;
 
 const XZ_CHECK: Check = Check::None;
 const PRESET_EXTREME: u32 = 1u32 << 31;
@@ -425,9 +426,12 @@ fn transform_gnuhash(buf: &mut [u8], is_compress: bool) {
     let nbuckets = LittleEndian::read_u32(&buf[0..4]) as usize;
     let maskwords = LittleEndian::read_u32(&buf[8..12]) as usize;
     
-    let header_end = 16;
-    let bloom_end = header_end + (maskwords * 8);
-    let bucket_end = bloom_end + (nbuckets * 4);
+    let header_end = 16usize;
+    let bloom_bytes = match maskwords.checked_mul(8) { Some(x) => x, None => return };
+    let buckets_bytes = match nbuckets.checked_mul(4) { Some(x) => x, None => return };
+    
+    let bloom_end = match header_end.checked_add(bloom_bytes) { Some(x) => x, None => return };
+    let bucket_end = match bloom_end.checked_add(buckets_bytes) { Some(x) => x, None => return };
     let max_bound = buf.len();
     
     let bl_e = bloom_end.min(max_bound);
@@ -681,6 +685,14 @@ fn process_eh_frame_hdr(file_data: &[u8], is_compress: bool, use_be: bool) -> Ve
             Some(sz) => sz,
             None => continue,
         };
+        
+        // Patch the eh_frame_ptr field!
+        if skip_sz == 4 && (eh_frame_ptr_enc == 0x1b || eh_frame_ptr_enc == 0x3b) {
+            let field_fo = file_off + pos;
+            let field_va = sec.address() + pos as u64;
+            let base_va = if eh_frame_ptr_enc == 0x1b { field_va } else { sec.address() };
+            patches.push(EhPatch { fo: field_fo, field_va: base_va });
+        }
         pos += skip_sz;
         
         let fde_count_sz = match eh_pe_fixed_size(fde_count_enc, 8) {
@@ -1167,6 +1179,8 @@ fn split_streams(file_data: &[u8], jump_tables: &[JumpTable]) -> (Vec<u8>, Vec<V
                 cat = CAT_DYNAMIC16; 
             } else if name.contains("cst16") {
                 cat = CAT_S16;
+            } else if name == ".gnu.hash" {
+                cat = CAT_GNUHASH;
             } else if name == ".gnu.version" {
                 cat = CAT_S2;
             } else if ptr_prefixes.iter().any(|p| name.starts_with(p)) || name.contains("array") || name.contains("cst8") {
