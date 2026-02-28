@@ -9,7 +9,9 @@ use std::time::Instant;
 use xz2::stream::{Check, Filters, LzmaOptions, Stream};
 
 const MAGIC: &[u8; 4] = b"FESv";
-const FORMAT_VERSION: u8 = 1;
+const FORMAT_VERSION: u8 = 5;
+const FUSED_NUM_BLOCK_CAT: usize = CAT_GNUHASH as usize;
+const NUM_FUSED_ORDER: [usize; 12] = [CAT_S2 as usize, CAT_S4 as usize, CAT_S8 as usize, CAT_RELR8 as usize, CAT_S16 as usize, CAT_REL16 as usize, CAT_DYNAMIC16 as usize, CAT_S24 as usize, CAT_RELA24 as usize, CAT_SYM24 as usize, CAT_JT4 as usize, CAT_GNUHASH as usize];
 
 const CAT_OTHER: u8 = 0;
 const CAT_CODE: u8 = 1;
@@ -81,6 +83,16 @@ fn write_block(out: &mut Vec<u8>, method: u8, payload: &[u8]) {
     let tag = ((payload.len() as u64) << 1) | ((method as u64) & 1);
     write_varint(out, tag);
     out.extend_from_slice(payload);
+}
+
+
+#[inline(always)]
+fn unzigzag64(z: u64) -> i64 {
+    ((z >> 1) as i64) ^ (-((z & 1) as i64))
+}
+#[inline(always)]
+fn unzigzag32(z: u32) -> i32 {
+    ((z >> 1) as i32) ^ (-((z & 1) as i32))
 }
 
 fn read_block<'a>(data: &'a [u8], pos: &mut usize) -> Result<(u8, &'a [u8]), String> {
@@ -301,16 +313,13 @@ fn transform_rela24(buf: &mut [u8], is_compress: bool) {
             prev_sym = sym;
             prev_add = add;
         } else {
-            let zz_off = off as i64;
-            let off_d = ((zz_off >> 1) ^ -(zz_off & 1)) as u64;
+            let off_d = unzigzag64(off) as u64;
             let off_v = if i == 0 { off_d } else { prev_off.wrapping_add(off_d) };
             
-            let zz_sym = (info >> 32) as i32;
-            let sym_d = ((zz_sym >> 1) ^ -(zz_sym & 1)) as u32;
+            let sym_d = unzigzag32((info >> 32) as u32) as u32;
             let sym_v = if i == 0 { sym_d } else { prev_sym.wrapping_add(sym_d) };
             
-            let u = add as i64; 
-            let add_d = ((u >> 1) ^ -(u & 1)) as i64;
+            let add_d = unzigzag64(add as u64);
             let add_v = if i == 0 { add_d } else { prev_add.wrapping_add(add_d) };
 
             LittleEndian::write_u64(&mut buf[p..p + 8], off_v);
@@ -352,12 +361,10 @@ fn transform_rel16(buf: &mut [u8], is_compress: bool) {
             prev_off = off;
             prev_sym = sym;
         } else {
-            let zz_off = off as i64;
-            let off_d = ((zz_off >> 1) ^ -(zz_off & 1)) as u64;
+            let off_d = unzigzag64(off) as u64;
             let off_v = if i == 0 { off_d } else { prev_off.wrapping_add(off_d) };
             
-            let zz_sym = (info >> 32) as i32;
-            let sym_d = ((zz_sym >> 1) ^ -(zz_sym & 1)) as u32;
+            let sym_d = unzigzag32((info >> 32) as u32) as u32;
             let sym_v = if i == 0 { sym_d } else { prev_sym.wrapping_add(sym_d) };
 
             LittleEndian::write_u64(&mut buf[p..p + 8], off_v);
@@ -400,16 +407,13 @@ fn transform_sym24(buf: &mut [u8], is_compress: bool) {
             prev_val = val;
             prev_sz = sz;
         } else {
-            let zz_name = name as i32;
-            let name_d = ((zz_name >> 1) ^ -(zz_name & 1)) as u32;
+            let name_d = unzigzag32(name) as u32;
             let name_v = if i == 0 { name_d } else { prev_name.wrapping_add(name_d) };
             
-            let zz_val = val as i64;
-            let val_d = ((zz_val >> 1) ^ -(zz_val & 1)) as u64;
+            let val_d = unzigzag64(val) as u64;
             let val_v  = if i == 0 { val_d } else { prev_val.wrapping_add(val_d) };
             
-            let zz_sz = sz as i64;
-            let sz_d = ((zz_sz >> 1) ^ -(zz_sz & 1)) as u64;
+            let sz_d = unzigzag64(sz) as u64;
             let sz_v   = if i == 0 { sz_d } else { prev_sz.wrapping_add(sz_d) };
 
             LittleEndian::write_u32(&mut buf[p..p + 4], name_v);
@@ -523,12 +527,10 @@ fn transform_dynamic16(buf: &mut [u8], is_compress: bool) {
             prev_tag = tag;
             prev_val = val;
         } else {
-            let zz_tag = tag as i64;
-            let tag_d = ((zz_tag >> 1) ^ -(zz_tag & 1)) as u64;
+            let tag_d = unzigzag64(tag) as u64;
             let tag_v = if i == 0 { tag_d } else { prev_tag.wrapping_add(tag_d) };
             
-            let zz_val = val as i64;
-            let val_d = ((zz_val >> 1) ^ -(zz_val & 1)) as u64;
+            let val_d = unzigzag64(val) as u64;
             let val_v = if i == 0 { val_d } else { prev_val.wrapping_add(val_d) };
 
             LittleEndian::write_u64(&mut buf[p..p + 8], tag_v);
@@ -952,13 +954,7 @@ fn process_eh_frame_hdr(file_data: &[u8], is_compress: bool, use_be: bool) -> Ve
             patches.push(EhPatch { fo: field_fo, field_va: base_va });
         }
         
-        // Patch the eh_frame_ptr field!
-        if skip_sz == 4 && (eh_frame_ptr_enc == 0x1b || eh_frame_ptr_enc == 0x3b) {
-            let field_fo = file_off + pos;
-            let field_va = sec.address() + pos as u64;
-            let base_va = if eh_frame_ptr_enc == 0x1b { field_va } else { sec.address() };
-            patches.push(EhPatch { fo: field_fo, field_va: base_va });
-        }
+
         pos += skip_sz;
         
         let fde_count_sz = match eh_pe_fixed_size(fde_count_enc, 8) {
@@ -1506,6 +1502,13 @@ fn compress_with_mode(file_data: &[u8], use_be: bool) -> Vec<u8> {
         *s = shuffle_bytes(s, stride);
     }
 
+
+    let mut num_fused = Vec::new();
+    for &c in &NUM_FUSED_ORDER {
+        num_fused.append(&mut streams[c]);
+    }
+    streams[FUSED_NUM_BLOCK_CAT] = num_fused;
+
     let blocks: Vec<Block> = streams.into_par_iter().enumerate().map(|(cat, s)| {
         if s.is_empty() { return Block { method: 0, payload: Vec::new() }; }
         let pb = choose_pb(cat);
@@ -1592,10 +1595,44 @@ fn decompress(data: &[u8]) -> Result<Vec<u8>, String> {
     if pos + jt_meta_len > data.len() { return Err("jt block out of range".into()); }
     let jt_meta = &data[pos..pos + jt_meta_len];
 
+
+    // Compute cat_lens early to unfuse
+    let mut cat_lens = [0usize; CAT_COUNT];
+    {
+        let mut rp = 0usize;
+        while rp < runs_data.len() {
+            let val = read_varint(runs_data, &mut rp)?;
+            let cat = (val & 15) as usize;
+            let count = (val >> 4) as usize;
+            if cat >= CAT_COUNT { return Err("bad category".into()); }
+            cat_lens[cat] = cat_lens[cat].saturating_add(count);
+        }
+    }
+
     let mut decompressed_streams: Vec<Vec<u8>> = blocks.par_iter()
         .map(|(method, payload)| {
             if *method == 0 { Ok(payload.to_vec()) } else { decompress_xz(payload) }
         }).collect::<Result<Vec<_>, _>>()?;
+
+    {
+        let mut fused = std::mem::take(&mut decompressed_streams[FUSED_NUM_BLOCK_CAT]);
+        let mut expected = 0usize;
+        for &c in &NUM_FUSED_ORDER { expected = expected.saturating_add(cat_lens[c]); }
+        if fused.len() != expected {
+            return Err(format!("num fused stream mismatch: got {} expected {}", fused.len(), expected));
+        }
+
+        let mut total = fused.len();
+        for &c in NUM_FUSED_ORDER.iter().rev() {
+            let len = cat_lens[c];
+            if len > total { return Err("num fused split underflow".into()); }
+            let start = total - len;
+            let part = fused.split_off(start);
+            decompressed_streams[c] = part;
+            total = start;
+        }
+    }
+
 
     let strides = [
         (CAT_S2, 2usize), (CAT_S4, 4usize), (CAT_S8, 8usize), (CAT_RELR8, 8usize),
