@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use byteorder::{ByteOrder, LittleEndian};
 use iced_x86::{Decoder, DecoderOptions};
 use object::{Architecture, Object, ObjectSection, ObjectSegment, SectionKind};
@@ -65,6 +66,29 @@ fn decompress_xz(data: &[u8]) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     decoder.read_to_end(&mut out).map_err(|e| e.to_string())?;
     Ok(out)
+}
+
+
+#[derive(Clone)]
+struct Block {
+    method: u8,
+    payload: Vec<u8>,
+}
+
+fn write_block(out: &mut Vec<u8>, method: u8, payload: &[u8]) {
+    let tag = ((payload.len() as u64) << 1) | ((method as u64) & 1);
+    write_varint(out, tag);
+    out.extend_from_slice(payload);
+}
+
+fn read_block<'a>(data: &'a [u8], pos: &mut usize) -> Result<(u8, &'a [u8]), String> {
+    let tag = read_varint(data, pos)?;
+    let method = (tag & 1) as u8;
+    let len = (tag >> 1) as usize;
+    if *pos + len > data.len() { return Err("block out of range".into()); }
+    let slice = &data[*pos..*pos + len];
+    *pos += len;
+    Ok((method, slice))
 }
 
 fn write_varint(buf: &mut Vec<u8>, mut val: u64) {
@@ -648,6 +672,332 @@ fn process_eh_frame_hdr(file_data: &[u8], is_compress: bool, use_be: bool) -> Ve
     out
 }
 
+
+#[derive(Debug, Clone, Copy)]
+struct CieInfo {
+    fde_ptr_enc: u8,
+    lsda_ptr_enc: Option<u8>,
+    has_z: bool,
+}
+
+fn read_uleb128(buf: &[u8], pos: &mut usize, end: usize) -> Option<u64> {
+    let mut result: u64 = 0;
+    let mut shift: u32 = 0;
+    while *pos < end {
+        let b = buf[*pos];
+        *pos += 1;
+        result |= ((b & 0x7F) as u64) << shift;
+        if (b & 0x80) == 0 { return Some(result); }
+        shift += 7;
+        if shift >= 64 { return None; }
+    }
+    None
+}
+
+fn read_sleb128(buf: &[u8], pos: &mut usize, end: usize) -> Option<i64> {
+    let mut result: i64 = 0;
+    let mut shift: u32 = 0;
+    let mut byte: u8;
+    loop {
+        if *pos >= end { return None; }
+        byte = buf[*pos];
+        *pos += 1;
+        result |= ((byte & 0x7F) as i64) << shift;
+        shift += 7;
+        if (byte & 0x80) == 0 { break; }
+        if shift >= 64 { return None; }
+    }
+    if shift < 64 && (byte & 0x40) != 0 {
+        result |= (!0i64) << shift;
+    }
+    Some(result)
+}
+
+fn read_c_string<'a>(buf: &'a [u8], pos: &mut usize, end: usize) -> Option<&'a [u8]> {
+    if *pos > end { return None; }
+    let start = *pos;
+    let mut i = start;
+    while i < end {
+        if buf[i] == 0 {
+            *pos = i + 1;
+            return Some(&buf[start..i]);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn patch_eh_pointer(
+    out: &mut [u8],
+    file_fo: usize,
+    field_va: u64,
+    enc: u8,
+    image_base: u64,
+    is_compress: bool,
+    use_be: bool,
+) {
+    let sz = match eh_pe_fixed_size(enc, 8) {
+        Some(s) => s,
+        None => return,
+    };
+    if sz == 0 { return; }
+    if file_fo + sz > out.len() { return; }
+
+    let app = enc & 0x70;
+    if app != 0x00 && app != 0x10 { return; }
+
+    match sz {
+        2 => {
+            let base = image_base as u16;
+            let field = field_va as u16;
+            if is_compress {
+                let v = LittleEndian::read_u16(&out[file_fo..file_fo + 2]);
+                let abs = if app == 0x10 { field.wrapping_add(v) } else { v };
+                let norm = abs.wrapping_sub(base);
+                let bytes = if use_be { norm.to_be_bytes() } else { norm.to_le_bytes() };
+                out[file_fo..file_fo + 2].copy_from_slice(&bytes);
+            } else {
+                let norm = if use_be { u16::from_be_bytes(out[file_fo..file_fo + 2].try_into().unwrap()) } 
+                else { LittleEndian::read_u16(&out[file_fo..file_fo + 2]) };
+                let abs = norm.wrapping_add(base);
+                let v = if app == 0x10 { abs.wrapping_sub(field) } else { abs };
+                LittleEndian::write_u16(&mut out[file_fo..file_fo + 2], v);
+            }
+        }
+        4 => {
+            let base = image_base as u32;
+            let field = field_va as u32;
+            if is_compress {
+                let v = LittleEndian::read_i32(&out[file_fo..file_fo + 4]);
+                let abs = if app == 0x10 { field.wrapping_add(v as u32) } else { v as u32 };
+                let norm = abs.wrapping_sub(base);
+                let bytes = if use_be { norm.to_be_bytes() } else { norm.to_le_bytes() };
+                out[file_fo..file_fo + 4].copy_from_slice(&bytes);
+            } else {
+                let norm = if use_be { u32::from_be_bytes(out[file_fo..file_fo + 4].try_into().unwrap()) } 
+                else { LittleEndian::read_u32(&out[file_fo..file_fo + 4]) };
+                let abs = norm.wrapping_add(base);
+                let v = if app == 0x10 { abs.wrapping_sub(field) } else { abs };
+                LittleEndian::write_u32(&mut out[file_fo..file_fo + 4], v);
+            }
+        }
+        8 => {
+            let base = image_base;
+            let field = field_va;
+            if is_compress {
+                let v = LittleEndian::read_i64(&out[file_fo..file_fo + 8]);
+                let abs = if app == 0x10 { field.wrapping_add(v as u64) } else { v as u64 };
+                let norm = abs.wrapping_sub(base);
+                let bytes = if use_be { norm.to_be_bytes() } else { norm.to_le_bytes() };
+                out[file_fo..file_fo + 8].copy_from_slice(&bytes);
+            } else {
+                let norm = if use_be { u64::from_be_bytes(out[file_fo..file_fo + 8].try_into().unwrap()) } 
+                else { LittleEndian::read_u64(&out[file_fo..file_fo + 8]) };
+                let abs = norm.wrapping_add(base);
+                let v = if app == 0x10 { abs.wrapping_sub(field) } else { abs };
+                LittleEndian::write_u64(&mut out[file_fo..file_fo + 8], v);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn process_eh_frame(file_data: &[u8], is_compress: bool, use_be: bool) -> Vec<u8> {
+    let mut out = file_data.to_vec();
+    let obj = match object::File::parse(file_data) {
+        Ok(o) => o,
+        Err(_) => return out,
+    };
+
+    if obj.architecture() != Architecture::X86_64 || !obj.is_little_endian() || !obj.is_64() {
+        return out;
+    }
+
+    let mut image_base = u64::MAX;
+    for seg in obj.segments() {
+        if seg.address() < image_base { image_base = seg.address(); }
+    }
+    if image_base == u64::MAX { image_base = 0; }
+
+    for sec in obj.sections() {
+        if sec.name().unwrap_or("") != ".eh_frame" { continue; }
+
+        let (sec_fo_u64, sec_sz_u64) = match sec.file_range() {
+            Some(r) => r,
+            None => continue,
+        };
+        let sec_fo = sec_fo_u64 as usize;
+        let sec_sz = sec_sz_u64 as usize;
+        if sec_fo + sec_sz > out.len() { continue; }
+
+        let sec_va = sec.address();
+        let data = match sec.data() {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        if data.len() != sec_sz { continue; }
+
+        let mut cie_map: HashMap<u32, CieInfo> = HashMap::new();
+        let mut pos = 0usize;
+
+        while pos + 4 <= data.len() {
+            let record_start = pos;
+            let len32 = LittleEndian::read_u32(&data[pos..pos + 4]);
+            if len32 == 0 { break; }
+
+            let (rec_len, header_len) = if len32 == 0xFFFF_FFFF {
+                if pos + 12 > data.len() { break; }
+                let len64 = LittleEndian::read_u64(&data[pos + 4..pos + 12]) as usize;
+                (len64, 12usize)
+            } else {
+                (len32 as usize, 4usize)
+            };
+
+            let record_end = record_start + header_len + rec_len;
+            if record_end > data.len() { break; }
+
+            let id_pos = record_start + header_len;
+            if id_pos + 4 > record_end {
+                pos = record_end;
+                continue;
+            }
+
+            let id = LittleEndian::read_u32(&data[id_pos..id_pos + 4]);
+            let mut p = id_pos + 4;
+
+            if id == 0 {
+                if p >= record_end { pos = record_end; continue; }
+                let version = data[p];
+                p += 1;
+
+                let aug = match read_c_string(data, &mut p, record_end) {
+                    Some(s) => s,
+                    None => { pos = record_end; continue; }
+                };
+
+                if read_uleb128(data, &mut p, record_end).is_none() { pos = record_end; continue; } 
+                if read_sleb128(data, &mut p, record_end).is_none() { pos = record_end; continue; } 
+
+                if version == 1 {
+                    if p >= record_end { pos = record_end; continue; }
+                    p += 1; 
+                } else {
+                    if read_uleb128(data, &mut p, record_end).is_none() { pos = record_end; continue; } 
+                }
+
+                let mut cie = CieInfo { fde_ptr_enc: 0x00, lsda_ptr_enc: None, has_z: false };
+
+                if !aug.is_empty() && aug[0] == b'z' {
+                    cie.has_z = true;
+                    let aug_len = match read_uleb128(data, &mut p, record_end) {
+                        Some(v) => v as usize,
+                        None => { pos = record_end; continue; }
+                    };
+                    if p + aug_len > record_end { pos = record_end; continue; }
+
+                    let aug_end = p + aug_len;
+                    let mut q = p;
+
+                    for &ch in &aug[1..] {
+                        match ch {
+                            b'L' => {
+                                if q >= aug_end { break; }
+                                cie.lsda_ptr_enc = Some(data[q]);
+                                q += 1;
+                            }
+                            b'R' => {
+                                if q >= aug_end { break; }
+                                cie.fde_ptr_enc = data[q];
+                                q += 1;
+                            }
+                            b'P' => {
+                                if q >= aug_end { break; }
+                                let p_enc = data[q];
+                                q += 1;
+
+                                if let Some(sz) = eh_pe_fixed_size(p_enc, 8) {
+                                    if q + sz > aug_end { break; }
+                                    let ptr_off = q;
+                                    patch_eh_pointer(
+                                        &mut out,
+                                        sec_fo + ptr_off,
+                                        sec_va + ptr_off as u64,
+                                        p_enc,
+                                        image_base,
+                                        is_compress,
+                                        use_be,
+                                    );
+                                    q += sz;
+                                } else { break; }
+                            }
+                            b'S' => {}
+                            _ => break, 
+                        }
+                    }
+                    
+                }
+                cie_map.insert(record_start as u32, cie);
+            } else {
+                let cie_start = (id_pos as u32).wrapping_sub(id);
+                let cie = match cie_map.get(&cie_start) {
+                    Some(c) => *c,
+                    None => { pos = record_end; continue; }
+                };
+
+                let ptr_sz = match eh_pe_fixed_size(cie.fde_ptr_enc, 8) {
+                    Some(sz) if sz > 0 => sz,
+                    _ => { pos = record_end; continue; }
+                };
+
+                if p + ptr_sz * 2 > record_end { pos = record_end; continue; }
+
+                let init_off = p;
+                patch_eh_pointer(
+                    &mut out,
+                    sec_fo + init_off,
+                    sec_va + init_off as u64,
+                    cie.fde_ptr_enc,
+                    image_base,
+                    is_compress,
+                    use_be,
+                );
+
+                p += ptr_sz; 
+                p += ptr_sz; 
+
+                if cie.has_z {
+                    let aug_len = match read_uleb128(data, &mut p, record_end) {
+                        Some(v) => v as usize,
+                        None => { pos = record_end; continue; }
+                    };
+                    if p + aug_len > record_end { pos = record_end; continue; }
+
+                    let aug_start = p;
+
+                    if let Some(lsda_enc) = cie.lsda_ptr_enc {
+                        if let Some(lsda_sz) = eh_pe_fixed_size(lsda_enc, 8) {
+                            if lsda_sz > 0 && aug_start + lsda_sz <= aug_start + aug_len {
+                                patch_eh_pointer(
+                                    &mut out,
+                                    sec_fo + aug_start,
+                                    sec_va + aug_start as u64,
+                                    lsda_enc,
+                                    image_base,
+                                    is_compress,
+                                    use_be,
+                                );
+                            }
+                        }
+                    }
+                    
+                }
+            }
+            pos = record_end;
+        }
+    }
+    out
+}
+
 // ---------------- USASE Patching ----------------
 
 #[derive(Debug, Clone, Copy)]
@@ -782,12 +1132,12 @@ fn split_streams(file_data: &[u8], jump_tables: &[JumpTable]) -> (Vec<u8>, Vec<V
         for &cat in &labels[1..] {
             if cat == cur_cat { count += 1; } 
             else {
-                write_varint(&mut runs, (count << 4) | (cur_cat as u64));
+                write_varint(&mut runs, (count << 5) | (cur_cat as u64));
                 cur_cat = cat;
                 count = 1;
             }
         }
-        write_varint(&mut runs, (count << 4) | (cur_cat as u64));
+        write_varint(&mut runs, (count << 5) | (cur_cat as u64));
     }
 
     let mut streams = vec![Vec::new(); CAT_COUNT];
@@ -798,6 +1148,7 @@ fn split_streams(file_data: &[u8], jump_tables: &[JumpTable]) -> (Vec<u8>, Vec<V
 fn compress_with_mode(file_data: &[u8], use_be: bool) -> Vec<u8> {
     let skel = process_binary(file_data, true, use_be);
     let skel = process_eh_frame_hdr(&skel, true, use_be);
+    let skel = process_eh_frame(&skel, true, use_be);
     let (skel, jt_meta, jump_tables) = process_jump_tables(&skel, true, use_be, None).unwrap();
     let skel = process_elf_tables(&skel, true);
     
@@ -816,30 +1167,36 @@ fn compress_with_mode(file_data: &[u8], use_be: bool) -> Vec<u8> {
         *s = shuffle_bytes(s, stride);
     }
 
-    let compressed_streams: Vec<Vec<u8>> = streams.par_iter().enumerate().map(|(cat, s)| {
-        if s.is_empty() { return vec![]; }
+    let blocks: Vec<Block> = streams.into_par_iter().enumerate().map(|(cat, s)| {
+        if s.is_empty() { return Block { method: 0, payload: Vec::new() }; }
         let pb = choose_pb(cat);
         let dict = choose_dict_size(s.len());
         
-        if cat != CAT_CODE as usize && cat != CAT_EH as usize && cat != CAT_OTHER as usize {
+        let compressed_best = if cat != CAT_CODE as usize && cat != CAT_EH as usize && cat != CAT_OTHER as usize {
             let mut opts_lc3 = LzmaOptions::new_preset(preset).unwrap();
             opts_lc3.position_bits(pb).dict_size(dict).literal_context_bits(3);
             let mut f3 = Filters::new(); f3.lzma2(&opts_lc3);
             let mut enc3 = xz2::write::XzEncoder::new_stream(Vec::new(), Stream::new_stream_encoder(&f3, XZ_CHECK).unwrap());
-            enc3.write_all(s).unwrap();
+            enc3.write_all(&s).unwrap();
             let mut c_best = enc3.finish().unwrap();
 
             let mut opts_lc0 = LzmaOptions::new_preset(preset).unwrap();
             opts_lc0.position_bits(pb).dict_size(dict).literal_context_bits(0);
             let mut f0 = Filters::new(); f0.lzma2(&opts_lc0);
             let mut enc0 = xz2::write::XzEncoder::new_stream(Vec::new(), Stream::new_stream_encoder(&f0, XZ_CHECK).unwrap());
-            enc0.write_all(s).unwrap();
+            enc0.write_all(&s).unwrap();
             let c0 = enc0.finish().unwrap();
             if c0.len() < c_best.len() { c_best = c0; }
 
             c_best
         } else {
-            compress_xz_tuned(s, preset, pb, dict)
+            compress_xz_tuned(&s, preset, pb, dict)
+        };
+
+        if compressed_best.len() < s.len() {
+            Block { method: 1, payload: compressed_best }
+        } else {
+            Block { method: 0, payload: s }
         }
     }).collect();
 
@@ -855,9 +1212,8 @@ fn compress_with_mode(file_data: &[u8], use_be: bool) -> Vec<u8> {
     write_varint(&mut out, runs.len() as u64);
     out.extend_from_slice(&runs);
 
-    for cs in compressed_streams {
-        write_varint(&mut out, cs.len() as u64);
-        out.extend_from_slice(&cs);
+    for b in blocks {
+        write_block(&mut out, b.method, &b.payload);
     }
     
     write_varint(&mut out, jt_meta.len() as u64);
@@ -884,20 +1240,20 @@ fn decompress(data: &[u8]) -> Result<Vec<u8>, String> {
     let runs_data = &data[pos..pos + runs_len];
     pos += runs_len;
 
-    let mut compressed_streams = Vec::with_capacity(CAT_COUNT);
+    let mut blocks: Vec<(u8, &[u8])> = Vec::with_capacity(CAT_COUNT);
     for _ in 0..CAT_COUNT {
-        let cs_len = read_varint(data, &mut pos)? as usize;
-        if pos + cs_len > data.len() { return Err("stream block out of range".into()); }
-        compressed_streams.push(&data[pos..pos + cs_len]);
-        pos += cs_len;
+        let (method, payload) = read_block(data, &mut pos)?;
+        blocks.push((method, payload));
     }
     
     let jt_meta_len = read_varint(data, &mut pos)? as usize;
     if pos + jt_meta_len > data.len() { return Err("jt block out of range".into()); }
     let jt_meta = &data[pos..pos + jt_meta_len];
 
-    let mut decompressed_streams: Vec<Vec<u8>> = compressed_streams.par_iter()
-        .map(|cs| decompress_xz(cs)).collect::<Result<Vec<_>, _>>()?;
+    let mut decompressed_streams: Vec<Vec<u8>> = blocks.par_iter()
+        .map(|(method, payload)| {
+            if *method == 0 { Ok(payload.to_vec()) } else { decompress_xz(payload) }
+        }).collect::<Result<Vec<_>, _>>()?;
 
     let strides = [
         (CAT_S2, 2usize), (CAT_S4, 4usize), (CAT_S8, 8usize), (CAT_RELR8, 8usize),
@@ -918,8 +1274,8 @@ fn decompress(data: &[u8]) -> Result<Vec<u8>, String> {
 
     while run_pos < runs_data.len() {
         let val = read_varint(runs_data, &mut run_pos)?;
-        let cat = (val & 15) as usize;
-        let count = (val >> 4) as usize;
+        let cat = (val & 31) as usize;
+        let count = (val >> 5) as usize;
 
         if cat >= CAT_COUNT { return Err("bad category".into()); }
         if skel_pos + count > skel.len() { return Err("runs exceed output length".into()); }
@@ -939,6 +1295,7 @@ fn decompress(data: &[u8]) -> Result<Vec<u8>, String> {
 
     let skel = process_elf_tables(&skel, false);
     let (skel, _, _) = process_jump_tables(&skel, false, use_be, Some(jt_meta))?;
+    let skel = process_eh_frame(&skel, false, use_be);
     let skel = process_eh_frame_hdr(&skel, false, use_be);
     Ok(process_binary(&skel, false, use_be))
 }
@@ -960,7 +1317,7 @@ fn main() {
             let d_time = start.elapsed();
             assert_eq!(data, decompressed, "Mismatch!");
 
-            println!("====== FESH USASE vE (EH_FRAME_HDR + Jump Tables + LC0 MoE) ======");
+            println!("====== FESH USASE vG (EH_FRAME_HDR + Jump Tables + LC0 MoE) ======");
             println!("Target File: {}", path);
             println!("Input:       {} bytes", data.len());
             let ratio = (compressed.len() as f64 / data.len() as f64) * 100.0;
