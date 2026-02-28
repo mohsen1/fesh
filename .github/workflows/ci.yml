@@ -90,7 +90,7 @@ jobs:
 
     - name: Execute Strict Reversibility Benchmark Python Wrapper
       run: |
-cat << 'PYEOF' > run_bench.py
+        cat << 'PYEOF' > run_bench.py
         import sys, os, subprocess, re
 
         def get_zstd(p):
@@ -199,7 +199,7 @@ cat << 'PYEOF' > run_bench.py
                 s = f"{format_size(val)} ({(val/orig)*100:.0f}%)"
                 return f"**{s}**" if name == winner_name else s
 
-            table += f"| `{r['name']}` | {format_size(orig)} | {fmt_col(gz, 'GZIP')} | {fmt_col(br, 'Brotli')} | {fmt_col(zst, 'ZSTD')} | {fmt_col(bcj, 'XZ BCJ')} | {fmt_col(fesh, 'FESH')} | {gain} |
+            table += f"| `{r['name']}` | {format_size(orig)} | {fmt_col(gz, 'GZIP')} | {fmt_col(br, 'Brotli')} | {fmt_col(zst, 'ZSTD')} | {fmt_col(bcj, 'XZ BCJ')} | {fmt_col(fesh, 'FESH')} | {gain} |\n"
 "
 
         mean_gain = total_fesh_gain_pct / total if total > 0 else 0.0
