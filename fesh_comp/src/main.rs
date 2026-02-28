@@ -545,23 +545,34 @@ fn transform_dynamic16(buf: &mut [u8], is_compress: bool) {
 struct JumpTable {
     fo: usize,
     count: usize,
+    mode: u8,
 }
 
-fn process_jump_tables(file_data: &[u8], is_compress: bool, use_be: bool, jt_meta_in: Option<&[u8]>) -> Result<(Vec<u8>, Vec<u8>, Vec<JumpTable>), String> {
+fn process_jump_tables(
+    file_data: &[u8],
+    is_compress: bool,
+    use_be: bool,
+    jt_meta_in: Option<&[u8]>,
+) -> Result<(Vec<u8>, Vec<u8>, Vec<JumpTable>), String> {
     let mut out = file_data.to_vec();
     let obj = match object::File::parse(file_data) {
         Ok(o) => o,
         Err(_) => return Ok((out, Vec::new(), Vec::new())),
     };
 
-    if obj.architecture() != Architecture::X86_64 { return Ok((out, Vec::new(), Vec::new())); }
+    if obj.architecture() != Architecture::X86_64 {
+        return Ok((out, Vec::new(), Vec::new()));
+    }
 
     let mut image_base = u64::MAX;
-    for sec in obj.segments() {
-        if sec.address() < image_base { image_base = sec.address(); }
+    for seg in obj.segments() {
+        if seg.address() < image_base {
+            image_base = seg.address();
+        }
     }
-    if image_base == u64::MAX { image_base = 0; }
-
+    if image_base == u64::MAX {
+        image_base = 0;
+    }
 
     let mut text_va = 0u64;
     let mut text_size = 0u64;
@@ -572,97 +583,231 @@ fn process_jump_tables(file_data: &[u8], is_compress: bool, use_be: bool, jt_met
             break;
         }
     }
+    if text_size == 0 {
+        return Ok((out, Vec::new(), Vec::new()));
+    }
+    let text_end = text_va.wrapping_add(text_size);
 
-    if text_size == 0 { return Ok((out, Vec::new(), Vec::new())); }
+    #[inline(always)]
+    fn jt_score_bytes(norm: u32, use_be: bool) -> [u8; 4] {
+        if use_be { norm.to_le_bytes() } else { norm.to_be_bytes() }
+    }
 
-    let mut tables = Vec::new();
+    fn score_mode(
+        data: &[u8],
+        run_start: usize,
+        run_count: usize,
+        sec_va: u64,
+        text_va: u64,
+        text_end: u64,
+        image_base: u64,
+        use_be: bool,
+        mode: u8,
+    ) -> Option<u64> {
+        let base_va = sec_va.wrapping_add(run_start as u64);
+
+        let mut prev = [0u8; 4];
+        let mut have_prev = false;
+        let mut score = 0u64;
+
+        for idx in 0..run_count {
+            let off = run_start + idx * 4;
+            if off + 4 > data.len() {
+                return None;
+            }
+
+            let rel = LittleEndian::read_i32(&data[off..off + 4]);
+            let anchor_va = if mode == 0 {
+                sec_va.wrapping_add(off as u64)
+            } else {
+                base_va
+            };
+
+            let target_va = anchor_va.wrapping_add(rel as i64 as u64);
+            if target_va < text_va || target_va >= text_end {
+                return None;
+            }
+
+            let norm = target_va.wrapping_sub(image_base) as u32;
+            let bytes = jt_score_bytes(norm, use_be);
+
+            if have_prev {
+                for j in 0..4 {
+                    if bytes[j] != prev[j] {
+                        score += 1;
+                    }
+                }
+            } else {
+                have_prev = true;
+            }
+
+            prev = bytes;
+        }
+
+        Some(score)
+    }
+
+    let mut tables: Vec<JumpTable> = Vec::new();
 
     if is_compress {
+        const MIN_RUN: usize = 4;
+
         for sec in obj.sections() {
             let name = sec.name().unwrap_or("");
-            if name != ".rodata" && name != ".data.rel.ro" { continue; }
-            
-            let (file_off, sec_size) = match sec.file_range() { Some(r) => r, None => continue };
-            let data = match sec.data() { Ok(d) => d, Err(_) => continue };
-            if data.len() != sec_size as usize { continue; }
-            
-            let mut current_run_start = 0;
-            let mut current_run_len = 0;
-            
+            if name != ".rodata" && name != ".data.rel.ro" {
+                continue;
+            }
+
+            let (file_off_u64, sec_size_u64) = match sec.file_range() {
+                Some(r) => r,
+                None => continue,
+            };
+            let file_off = file_off_u64 as usize;
+
+            let data = match sec.data() {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            if data.len() != sec_size_u64 as usize {
+                continue;
+            }
+
+            let sec_va = sec.address();
+
+            let mut run_start = 0usize;
+            let mut run_len = 0usize;
+
             for i in (0..data.len().saturating_sub(3)).step_by(4) {
-                let val = LittleEndian::read_i32(&data[i..i+4]);
-                let entry_va = sec.address() + i as u64;
-                let target_va = entry_va.wrapping_add(val as i64 as u64);
-                
-                if target_va >= text_va && target_va < text_va + text_size {
-                    if current_run_len == 0 { current_run_start = file_off as usize + i; }
-                    current_run_len += 1;
+                let rel = LittleEndian::read_i32(&data[i..i + 4]);
+                let entry_va = sec_va.wrapping_add(i as u64);
+                let target_va = entry_va.wrapping_add(rel as i64 as u64);
+
+                if target_va >= text_va && target_va < text_end {
+                    if run_len == 0 {
+                        run_start = i;
+                    }
+                    run_len += 1;
                 } else {
-                    if current_run_len >= 4 { tables.push(JumpTable { fo: current_run_start, count: current_run_len }); }
-                    current_run_len = 0;
+                    if run_len >= MIN_RUN {
+                        let s_entry = score_mode(data, run_start, run_len, sec_va, text_va, text_end, image_base, use_be, 0).unwrap_or(u64::MAX / 2);
+                        let s_base = score_mode(data, run_start, run_len, sec_va, text_va, text_end, image_base, use_be, 1).unwrap_or(u64::MAX / 2);
+
+                        let mode = if s_base < s_entry { 1u8 } else { 0u8 };
+
+                        tables.push(JumpTable {
+                            fo: file_off + run_start,
+                            count: run_len,
+                            mode,
+                        });
+                    }
+                    run_len = 0;
                 }
             }
-            if current_run_len >= 4 { tables.push(JumpTable { fo: current_run_start, count: current_run_len }); }
+
+            if run_len >= MIN_RUN {
+                let s_entry = score_mode(data, run_start, run_len, sec_va, text_va, text_end, image_base, use_be, 0).unwrap_or(u64::MAX / 2);
+                let s_base = score_mode(data, run_start, run_len, sec_va, text_va, text_end, image_base, use_be, 1).unwrap_or(u64::MAX / 2);
+
+                let mode = if s_base < s_entry { 1u8 } else { 0u8 };
+
+                tables.push(JumpTable {
+                    fo: file_off + run_start,
+                    count: run_len,
+                    mode,
+                });
+            }
         }
     } else {
         let meta = jt_meta_in.unwrap_or(&[]);
-        let mut pos = 0;
+        let mut pos = 0usize;
+
         let num_tables = match read_varint(meta, &mut pos) {
             Ok(v) => v as usize,
-            Err(_) => return Ok((out, Vec::new(), Vec::new())), 
+            Err(_) => return Ok((out, Vec::new(), Vec::new())),
         };
-        
-        let mut prev_fo = 0;
+
+        let mut prev_fo = 0usize;
         for _ in 0..num_tables {
             let delta_fo = read_varint(meta, &mut pos)? as usize;
-            let count = read_varint(meta, &mut pos)? as usize;
+            let packed = read_varint(meta, &mut pos)? as u64;
+
             let fo = prev_fo + delta_fo;
             prev_fo = fo;
-            tables.push(JumpTable { fo, count });
+
+            let mode = (packed & 1) as u8;
+            let count = (packed >> 1) as usize;
+
+            tables.push(JumpTable { fo, count, mode });
         }
     }
 
     let mut meta_out = Vec::new();
     if is_compress {
         write_varint(&mut meta_out, tables.len() as u64);
-        let mut prev_fo = 0;
+        let mut prev_fo = 0usize;
+        let mut mode_base_count = 0;
+        let mut mode_entry_count = 0;
         for t in &tables {
             write_varint(&mut meta_out, (t.fo - prev_fo) as u64);
-            write_varint(&mut meta_out, t.count as u64);
+            let packed = ((t.count as u64) << 1) | ((t.mode as u64) & 1);
+            write_varint(&mut meta_out, packed);
             prev_fo = t.fo;
+            
+            if t.mode == 1 { mode_base_count += t.count; }
+            else { mode_entry_count += t.count; }
         }
     }
 
     let file_to_va = |offset: u64| -> Option<u64> {
         for sec in obj.sections() {
             if let Some((fo, size)) = sec.file_range() {
-                if offset >= fo && offset < fo + size { return Some(sec.address() + (offset - fo)); }
+                if offset >= fo && offset < fo + size {
+                    return Some(sec.address() + (offset - fo));
+                }
             }
         }
         None
     };
 
     for t in &tables {
+        let base_va = file_to_va(t.fo as u64).unwrap_or(0);
+
         for i in 0..t.count {
             let p = t.fo + (i * 4);
+            if p + 4 > out.len() { continue; }
+
             let entry_va = file_to_va(p as u64).unwrap_or(0);
-            
+            let anchor_va = if t.mode == 0 { entry_va } else { base_va };
+
             if is_compress {
-                let val = LittleEndian::read_i32(&out[p..p+4]);
-                let target_va = entry_va.wrapping_add(val as i64 as u64).wrapping_sub(image_base) as u32;
-                if use_be { out[p..p+4].copy_from_slice(&target_va.to_be_bytes()); } 
-                else { out[p..p+4].copy_from_slice(&target_va.to_le_bytes()); }
+                let rel = LittleEndian::read_i32(&out[p..p + 4]);
+                let target_va = anchor_va
+                    .wrapping_add(rel as i64 as u64)
+                    .wrapping_sub(image_base) as u32;
+
+                if use_be {
+                    out[p..p + 4].copy_from_slice(&target_va.to_be_bytes());
+                } else {
+                    out[p..p + 4].copy_from_slice(&target_va.to_le_bytes());
+                }
             } else {
-                let target_va = if use_be { u32::from_be_bytes(out[p..p+4].try_into().unwrap()) } 
-                else { LittleEndian::read_u32(&out[p..p+4]) };
-                let orig_rel = (target_va as u64).wrapping_add(image_base).wrapping_sub(entry_va) as u32;
-                LittleEndian::write_u32(&mut out[p..p+4], orig_rel);
+                let norm = if use_be {
+                    u32::from_be_bytes(out[p..p + 4].try_into().unwrap())
+                } else {
+                    LittleEndian::read_u32(&out[p..p + 4])
+                };
+
+                let target_va = (norm as u64).wrapping_add(image_base);
+                let orig_rel = target_va.wrapping_sub(anchor_va) as u32;
+
+                LittleEndian::write_u32(&mut out[p..p + 4], orig_rel);
             }
         }
     }
 
     Ok((out, meta_out, tables))
 }
+
 
 // ---------------- EH Frame PC-Rel Normalization ----------------
 
