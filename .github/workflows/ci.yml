@@ -205,12 +205,11 @@ cat << 'PYEOF' > run_bench.py
         mean_gain = total_fesh_gain_pct / total if total > 0 else 0.0
 
         readme = f"""# FESH (Fast ELF Semantic Heuristics)
+> 🚀 **FESH is on average {mean_gain:.1f}% more efficient than `xz -9e --x86` (XZ BCJ) across the top 100 Linux distribution packages.**
 
 FESH is a specialized compression pre-processor for x86_64 ELF binaries. It leverages native binary structure to vastly improve traditional LZMA (XZ) dictionary chains.
 
 By deterministically lifting structural mechanics (e.g. Near Branches, RIP-relative addressing, and ELF Relocation structures) into absolute, fixed-width delta domains, FESH achieves **zero-metadata exact reversibility** while compressing executable artifacts deeper than standard `xz -9e` and `xz --x86`.
-
-**FESH reduces sizes by a mean of {mean_gain:.1f}% explicitly beyond maximum XZ BCJ limits.**
 
 ## Architecture: USASE vH
 **USASE** (Unified Semantic Address Space Extraction) is the core engine driving FESH. It has four main pillars:
