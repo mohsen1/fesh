@@ -8,7 +8,8 @@ use std::io::{Read, Write};
 use std::time::Instant;
 use xz2::stream::{Check, Filters, LzmaOptions, Stream};
 
-const MAGIC: &[u8; 4] = b"FESC";
+const MAGIC: &[u8; 4] = b"FESv";
+const FORMAT_VERSION: u8 = 1;
 
 const CAT_OTHER: u8 = 0;
 const CAT_CODE: u8 = 1;
@@ -259,6 +260,8 @@ fn process_elf_tables(file_data: &[u8], is_compress: bool) -> Vec<u8> {
             transform_relr8(slice, is_compress);
         } else if name == ".dynamic" {
             transform_dynamic16(slice, is_compress);
+        } else if name == ".gnu.hash" {
+            transform_gnuhash(slice, is_compress);
         }
     }
     out
@@ -411,6 +414,56 @@ fn transform_relr8(buf: &mut [u8], is_compress: bool) {
                 LittleEndian::write_u64(&mut buf[p..p + 8], base);
                 prev_base = base;
             }
+        }
+    }
+}
+
+
+fn transform_gnuhash(buf: &mut [u8], is_compress: bool) {
+    if buf.len() < 16 { return; }
+    
+    let nbuckets = LittleEndian::read_u32(&buf[0..4]) as usize;
+    let maskwords = LittleEndian::read_u32(&buf[8..12]) as usize;
+    
+    let header_end = 16;
+    let bloom_end = header_end + (maskwords * 8);
+    let bucket_end = bloom_end + (nbuckets * 4);
+    let max_bound = buf.len();
+    
+    let bl_e = bloom_end.min(max_bound);
+    let bu_e = bucket_end.min(max_bound);
+    
+    if header_end < bl_e {
+        if is_compress {
+            bswap_u64_array(&mut buf[header_end..bl_e]);
+            let s = shuffle_bytes(&buf[header_end..bl_e], 8);
+            buf[header_end..bl_e].copy_from_slice(&s);
+        } else {
+            let s = unshuffle_bytes(&buf[header_end..bl_e], 8);
+            buf[header_end..bl_e].copy_from_slice(&s);
+            bswap_u64_array(&mut buf[header_end..bl_e]);
+        }
+    }
+    if bl_e < bu_e {
+        if is_compress {
+            bswap_u32_array(&mut buf[bl_e..bu_e]);
+            let s = shuffle_bytes(&buf[bl_e..bu_e], 4);
+            buf[bl_e..bu_e].copy_from_slice(&s);
+        } else {
+            let s = unshuffle_bytes(&buf[bl_e..bu_e], 4);
+            buf[bl_e..bu_e].copy_from_slice(&s);
+            bswap_u32_array(&mut buf[bl_e..bu_e]);
+        }
+    }
+    if bu_e < max_bound {
+        if is_compress {
+            bswap_u32_array(&mut buf[bu_e..max_bound]);
+            let s = shuffle_bytes(&buf[bu_e..max_bound], 4);
+            buf[bu_e..max_bound].copy_from_slice(&s);
+        } else {
+            let s = unshuffle_bytes(&buf[bu_e..max_bound], 4);
+            buf[bu_e..max_bound].copy_from_slice(&s);
+            bswap_u32_array(&mut buf[bu_e..max_bound]);
         }
     }
 }
@@ -655,16 +708,22 @@ fn process_eh_frame_hdr(file_data: &[u8], is_compress: bool, use_be: bool) -> Ve
     for p in patches {
         if is_compress {
             let cur_rel = LittleEndian::read_i32(&out[p.fo..p.fo + 4]);
-            let mut abs_va = p.field_va.wrapping_add(cur_rel as i64 as u64);
-            if abs_va >= image_base { abs_va -= image_base; }
-            if abs_va > u32::MAX as u64 { continue; }
-            let abs_va32 = abs_va as u32;
-            if use_be { out[p.fo..p.fo + 4].copy_from_slice(&abs_va32.to_be_bytes()); } 
-            else { out[p.fo..p.fo + 4].copy_from_slice(&abs_va32.to_le_bytes()); }
+            let abs_va = p.field_va.wrapping_add(cur_rel as i64 as u64);
+            let norm32 = abs_va.wrapping_sub(image_base) as u32;
+            
+            if use_be {
+                out[p.fo..p.fo + 4].copy_from_slice(&norm32.to_be_bytes());
+            } else {
+                out[p.fo..p.fo + 4].copy_from_slice(&norm32.to_le_bytes());
+            }
         } else {
-            let abs_va32 = if use_be { u32::from_be_bytes(out[p.fo..p.fo + 4].try_into().unwrap()) } 
-            else { LittleEndian::read_u32(&out[p.fo..p.fo + 4]) };
-            let orig_rel = (abs_va32 as u64).wrapping_add(image_base).wrapping_sub(p.field_va) as u32;
+            let norm32 = if use_be {
+                u32::from_be_bytes(out[p.fo..p.fo + 4].try_into().unwrap())
+            } else {
+                LittleEndian::read_u32(&out[p.fo..p.fo + 4])
+            };
+            
+            let orig_rel = (norm32 as u64).wrapping_add(image_base).wrapping_sub(p.field_va) as u32;
             LittleEndian::write_u32(&mut out[p.fo..p.fo + 4], orig_rel);
         }
     }
@@ -1132,12 +1191,12 @@ fn split_streams(file_data: &[u8], jump_tables: &[JumpTable]) -> (Vec<u8>, Vec<V
         for &cat in &labels[1..] {
             if cat == cur_cat { count += 1; } 
             else {
-                write_varint(&mut runs, (count << 5) | (cur_cat as u64));
+                write_varint(&mut runs, (count << 4) | (cur_cat as u64));
                 cur_cat = cat;
                 count = 1;
             }
         }
-        write_varint(&mut runs, (count << 5) | (cur_cat as u64));
+        write_varint(&mut runs, (count << 4) | (cur_cat as u64));
     }
 
     let mut streams = vec![Vec::new(); CAT_COUNT];
@@ -1202,6 +1261,7 @@ fn compress_with_mode(file_data: &[u8], use_be: bool) -> Vec<u8> {
 
     let mut out = Vec::new();
     out.extend_from_slice(MAGIC);
+    out.push(FORMAT_VERSION);
 
     let mut orig_len_buf = [0u8; 8];
     LittleEndian::write_u64(&mut orig_len_buf, file_data.len() as u64);
@@ -1228,10 +1288,12 @@ fn compress(file_data: &[u8]) -> Vec<u8> {
 }
 
 fn decompress(data: &[u8]) -> Result<Vec<u8>, String> {
-    if data.len() < 13 { return Err("input too short".into()); }
+    if data.len() < 14 { return Err("input too short".into()); }
     if &data[0..4] != MAGIC { return Err("bad magic".into()); }
-    let orig_len = LittleEndian::read_u64(&data[4..12]) as usize;
-    let mut pos = 12usize;
+    let version = data[4];
+    if version != FORMAT_VERSION { return Err("unsupported format version".into()); }
+    let orig_len = LittleEndian::read_u64(&data[5..13]) as usize;
+    let mut pos = 13usize;
     let use_be = data[pos] == 1;
     pos += 1;
 
@@ -1274,8 +1336,8 @@ fn decompress(data: &[u8]) -> Result<Vec<u8>, String> {
 
     while run_pos < runs_data.len() {
         let val = read_varint(runs_data, &mut run_pos)?;
-        let cat = (val & 31) as usize;
-        let count = (val >> 5) as usize;
+        let cat = (val & 15) as usize;
+        let count = (val >> 4) as usize;
 
         if cat >= CAT_COUNT { return Err("bad category".into()); }
         if skel_pos + count > skel.len() { return Err("runs exceed output length".into()); }
