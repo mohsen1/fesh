@@ -288,8 +288,11 @@ fn transform_rela24(buf: &mut [u8], is_compress: bool) {
             let sym_d = if i == 0 { sym } else { sym.wrapping_sub(prev_sym) };
             let add_d = if i == 0 { add } else { add.wrapping_sub(prev_add) };
 
-            LittleEndian::write_u64(&mut buf[p..p + 8], off_d);
-            let info2 = ((sym_d as u64) << 32) | (typ as u64);
+            let zz_off = ((off_d as i64) << 1) ^ ((off_d as i64) >> 63);
+            let zz_sym = ((sym_d as i32) << 1) ^ ((sym_d as i32) >> 31);
+            
+            LittleEndian::write_u64(&mut buf[p..p + 8], zz_off as u64);
+            let info2 = ((zz_sym as u64) << 32) | (typ as u64);
             LittleEndian::write_u64(&mut buf[p + 8..p + 16], info2);
             let zz_add = ((add_d << 1) ^ (add_d >> 63)) as u64;
             LittleEndian::write_u64(&mut buf[p + 16..p + 24], zz_add);
@@ -298,11 +301,16 @@ fn transform_rela24(buf: &mut [u8], is_compress: bool) {
             prev_sym = sym;
             prev_add = add;
         } else {
-            let off_v = if i == 0 { off } else { prev_off.wrapping_add(off) };
-            let sym_d = (info >> 32) as u32;
+            let zz_off = off as i64;
+            let off_d = ((zz_off >> 1) ^ -(zz_off & 1)) as u64;
+            let off_v = if i == 0 { off_d } else { prev_off.wrapping_add(off_d) };
+            
+            let zz_sym = (info >> 32) as i32;
+            let sym_d = ((zz_sym >> 1) ^ -(zz_sym & 1)) as u32;
             let sym_v = if i == 0 { sym_d } else { prev_sym.wrapping_add(sym_d) };
-            let u = add as u64; 
-            let add_d = ((u >> 1) as i64) ^ (-((u & 1) as i64));
+            
+            let u = add as i64; 
+            let add_d = ((u >> 1) ^ -(u & 1)) as i64;
             let add_v = if i == 0 { add_d } else { prev_add.wrapping_add(add_d) };
 
             LittleEndian::write_u64(&mut buf[p..p + 8], off_v);
@@ -333,16 +341,23 @@ fn transform_rel16(buf: &mut [u8], is_compress: bool) {
         if is_compress {
             let off_d = if i == 0 { off } else { off.wrapping_sub(prev_off) };
             let sym_d = if i == 0 { sym } else { sym.wrapping_sub(prev_sym) };
+            
+            let zz_off = ((off_d as i64) << 1) ^ ((off_d as i64) >> 63);
+            let zz_sym = ((sym_d as i32) << 1) ^ ((sym_d as i32) >> 31);
 
-            LittleEndian::write_u64(&mut buf[p..p + 8], off_d);
-            let info2 = ((sym_d as u64) << 32) | (typ as u64);
+            LittleEndian::write_u64(&mut buf[p..p + 8], zz_off as u64);
+            let info2 = ((zz_sym as u64) << 32) | (typ as u64);
             LittleEndian::write_u64(&mut buf[p + 8..p + 16], info2);
 
             prev_off = off;
             prev_sym = sym;
         } else {
-            let off_v = if i == 0 { off } else { prev_off.wrapping_add(off) };
-            let sym_d = (info >> 32) as u32;
+            let zz_off = off as i64;
+            let off_d = ((zz_off >> 1) ^ -(zz_off & 1)) as u64;
+            let off_v = if i == 0 { off_d } else { prev_off.wrapping_add(off_d) };
+            
+            let zz_sym = (info >> 32) as i32;
+            let sym_d = ((zz_sym >> 1) ^ -(zz_sym & 1)) as u32;
             let sym_v = if i == 0 { sym_d } else { prev_sym.wrapping_add(sym_d) };
 
             LittleEndian::write_u64(&mut buf[p..p + 8], off_v);
@@ -372,18 +387,30 @@ fn transform_sym24(buf: &mut [u8], is_compress: bool) {
             let name_d = if i == 0 { name } else { name.wrapping_sub(prev_name) };
             let val_d  = if i == 0 { val } else { val.wrapping_sub(prev_val) };
             let sz_d   = if i == 0 { sz } else { sz.wrapping_sub(prev_sz) };
+            
+            let zz_name = ((name_d as i32) << 1) ^ ((name_d as i32) >> 31);
+            let zz_val = ((val_d as i64) << 1) ^ ((val_d as i64) >> 63);
+            let zz_sz = ((sz_d as i64) << 1) ^ ((sz_d as i64) >> 63);
 
-            LittleEndian::write_u32(&mut buf[p..p + 4], name_d);
-            LittleEndian::write_u64(&mut buf[p + 8..p + 16], val_d);
-            LittleEndian::write_u64(&mut buf[p + 16..p + 24], sz_d);
+            LittleEndian::write_u32(&mut buf[p..p + 4], zz_name as u32);
+            LittleEndian::write_u64(&mut buf[p + 8..p + 16], zz_val as u64);
+            LittleEndian::write_u64(&mut buf[p + 16..p + 24], zz_sz as u64);
 
             prev_name = name;
             prev_val = val;
             prev_sz = sz;
         } else {
-            let name_v = if i == 0 { name } else { prev_name.wrapping_add(name) };
-            let val_v  = if i == 0 { val } else { prev_val.wrapping_add(val) };
-            let sz_v   = if i == 0 { sz } else { prev_sz.wrapping_add(sz) };
+            let zz_name = name as i32;
+            let name_d = ((zz_name >> 1) ^ -(zz_name & 1)) as u32;
+            let name_v = if i == 0 { name_d } else { prev_name.wrapping_add(name_d) };
+            
+            let zz_val = val as i64;
+            let val_d = ((zz_val >> 1) ^ -(zz_val & 1)) as u64;
+            let val_v  = if i == 0 { val_d } else { prev_val.wrapping_add(val_d) };
+            
+            let zz_sz = sz as i64;
+            let sz_d = ((zz_sz >> 1) ^ -(zz_sz & 1)) as u64;
+            let sz_v   = if i == 0 { sz_d } else { prev_sz.wrapping_add(sz_d) };
 
             LittleEndian::write_u32(&mut buf[p..p + 4], name_v);
             LittleEndian::write_u64(&mut buf[p + 8..p + 16], val_v);
@@ -486,15 +513,23 @@ fn transform_dynamic16(buf: &mut [u8], is_compress: bool) {
         if is_compress {
             let tag_d = if i == 0 { tag } else { tag.wrapping_sub(prev_tag) };
             let val_d = if i == 0 { val } else { val.wrapping_sub(prev_val) };
+            
+            let zz_tag = ((tag_d as i64) << 1) ^ ((tag_d as i64) >> 63);
+            let zz_val = ((val_d as i64) << 1) ^ ((val_d as i64) >> 63);
 
-            LittleEndian::write_u64(&mut buf[p..p + 8], tag_d);
-            LittleEndian::write_u64(&mut buf[p + 8..p + 16], val_d);
+            LittleEndian::write_u64(&mut buf[p..p + 8], zz_tag as u64);
+            LittleEndian::write_u64(&mut buf[p + 8..p + 16], zz_val as u64);
 
             prev_tag = tag;
             prev_val = val;
         } else {
-            let tag_v = if i == 0 { tag } else { prev_tag.wrapping_add(tag) };
-            let val_v = if i == 0 { val } else { prev_val.wrapping_add(val) };
+            let zz_tag = tag as i64;
+            let tag_d = ((zz_tag >> 1) ^ -(zz_tag & 1)) as u64;
+            let tag_v = if i == 0 { tag_d } else { prev_tag.wrapping_add(tag_d) };
+            
+            let zz_val = val as i64;
+            let val_d = ((zz_val >> 1) ^ -(zz_val & 1)) as u64;
+            let val_v = if i == 0 { val_d } else { prev_val.wrapping_add(val_d) };
 
             LittleEndian::write_u64(&mut buf[p..p + 8], tag_v);
             LittleEndian::write_u64(&mut buf[p + 8..p + 16], val_v);
