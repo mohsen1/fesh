@@ -589,12 +589,21 @@ fn process_jump_tables(
     let text_end = text_va.wrapping_add(text_size);
 
     #[inline(always)]
-    fn jt_score_bytes(norm: u32, use_be: bool) -> [u8; 4] {
-        if use_be { norm.to_le_bytes() } else { norm.to_be_bytes() }
+    fn zigzag32(v: i32) -> u32 {
+        ((v << 1) ^ (v >> 31)) as u32
+    }
+    #[inline(always)]
+    fn unzigzag32(z: u32) -> i32 {
+        ((z >> 1) as i32) ^ (-((z & 1) as i32))
     }
 
-    fn score_mode(
-        data: &[u8],
+    #[inline(always)]
+    fn jt_score_bytes(v: u32, use_be: bool) -> [u8; 4] {
+        if use_be { v.to_le_bytes() } else { v.to_be_bytes() }
+    }
+
+    fn score_table_mode(
+        sec_data: &[u8],
         run_start: usize,
         run_count: usize,
         sec_va: u64,
@@ -604,24 +613,28 @@ fn process_jump_tables(
         use_be: bool,
         mode: u8,
     ) -> Option<u64> {
+        let anchor_is_base = (mode & 0x01) != 0;
+        let use_delta = (mode & 0x02) != 0;
+
         let base_va = sec_va.wrapping_add(run_start as u64);
 
-        let mut prev = [0u8; 4];
-        let mut have_prev = false;
-        let mut score = 0u64;
+        let mut prev_lane = [0u8; 4];
+        let mut have_prev_lane = false;
+
+        let mut prev_norm: u32 = 0;
+        let mut have_prev_norm = false;
+
+        let mut score: u64 = 0;
 
         for idx in 0..run_count {
             let off = run_start + idx * 4;
-            if off + 4 > data.len() {
+            if off + 4 > sec_data.len() {
                 return None;
             }
 
-            let rel = LittleEndian::read_i32(&data[off..off + 4]);
-            let anchor_va = if mode == 0 {
-                sec_va.wrapping_add(off as u64)
-            } else {
-                base_va
-            };
+            let rel = LittleEndian::read_i32(&sec_data[off..off + 4]);
+            let entry_va = sec_va.wrapping_add(off as u64);
+            let anchor_va = if anchor_is_base { base_va } else { entry_va };
 
             let target_va = anchor_va.wrapping_add(rel as i64 as u64);
             if target_va < text_va || target_va >= text_end {
@@ -629,19 +642,33 @@ fn process_jump_tables(
             }
 
             let norm = target_va.wrapping_sub(image_base) as u32;
-            let bytes = jt_score_bytes(norm, use_be);
 
-            if have_prev {
+            let enc = if use_delta {
+                if !have_prev_norm {
+                    have_prev_norm = true;
+                    prev_norm = norm;
+                    norm
+                } else {
+                    let diff = norm.wrapping_sub(prev_norm) as i32;
+                    prev_norm = norm;
+                    zigzag32(diff)
+                }
+            } else {
+                norm
+            };
+
+            let lane = jt_score_bytes(enc, use_be);
+
+            if have_prev_lane {
                 for j in 0..4 {
-                    if bytes[j] != prev[j] {
+                    if lane[j] != prev_lane[j] {
                         score += 1;
                     }
                 }
             } else {
-                have_prev = true;
+                have_prev_lane = true;
             }
-
-            prev = bytes;
+            prev_lane = lane;
         }
 
         Some(score)
@@ -689,15 +716,25 @@ fn process_jump_tables(
                     run_len += 1;
                 } else {
                     if run_len >= MIN_RUN {
-                        let s_entry = score_mode(data, run_start, run_len, sec_va, text_va, text_end, image_base, use_be, 0).unwrap_or(u64::MAX / 2);
-                        let s_base = score_mode(data, run_start, run_len, sec_va, text_va, text_end, image_base, use_be, 1).unwrap_or(u64::MAX / 2);
+                        let mut best_mode: u8 = 0;
+                        let mut best_score: u64 = u64::MAX;
 
-                        let mode = if s_base < s_entry { 1u8 } else { 0u8 };
+                        for mode in 0u8..4u8 {
+                            if let Some(s) = score_table_mode(
+                                data, run_start, run_len, sec_va, text_va, text_end,
+                                image_base, use_be, mode,
+                            ) {
+                                if s < best_score {
+                                    best_score = s;
+                                    best_mode = mode;
+                                }
+                            }
+                        }
 
                         tables.push(JumpTable {
                             fo: file_off + run_start,
                             count: run_len,
-                            mode,
+                            mode: best_mode,
                         });
                     }
                     run_len = 0;
@@ -705,15 +742,25 @@ fn process_jump_tables(
             }
 
             if run_len >= MIN_RUN {
-                let s_entry = score_mode(data, run_start, run_len, sec_va, text_va, text_end, image_base, use_be, 0).unwrap_or(u64::MAX / 2);
-                let s_base = score_mode(data, run_start, run_len, sec_va, text_va, text_end, image_base, use_be, 1).unwrap_or(u64::MAX / 2);
+                let mut best_mode: u8 = 0;
+                let mut best_score: u64 = u64::MAX;
 
-                let mode = if s_base < s_entry { 1u8 } else { 0u8 };
+                for mode in 0u8..4u8 {
+                    if let Some(s) = score_table_mode(
+                        data, run_start, run_len, sec_va, text_va, text_end,
+                        image_base, use_be, mode,
+                    ) {
+                        if s < best_score {
+                            best_score = s;
+                            best_mode = mode;
+                        }
+                    }
+                }
 
                 tables.push(JumpTable {
                     fo: file_off + run_start,
                     count: run_len,
-                    mode,
+                    mode: best_mode,
                 });
             }
         }
@@ -734,8 +781,8 @@ fn process_jump_tables(
             let fo = prev_fo + delta_fo;
             prev_fo = fo;
 
-            let mode = (packed & 1) as u8;
-            let count = (packed >> 1) as usize;
+            let mode = (packed & 3) as u8;
+            let count = (packed >> 2) as usize;
 
             tables.push(JumpTable { fo, count, mode });
         }
@@ -745,16 +792,17 @@ fn process_jump_tables(
     if is_compress {
         write_varint(&mut meta_out, tables.len() as u64);
         let mut prev_fo = 0usize;
-        let mut mode_base_count = 0;
-        let mut mode_entry_count = 0;
+        let mut mode_counts = [0; 4];
         for t in &tables {
             write_varint(&mut meta_out, (t.fo - prev_fo) as u64);
-            let packed = ((t.count as u64) << 1) | ((t.mode as u64) & 1);
+            let packed = ((t.count as u64) << 2) | ((t.mode as u64) & 3);
             write_varint(&mut meta_out, packed);
             prev_fo = t.fo;
-            
-            if t.mode == 1 { mode_base_count += t.count; }
-            else { mode_entry_count += t.count; }
+            mode_counts[t.mode as usize] += t.count;
+        }
+        // Just print counts on the largest execution branch for debugging
+        if mode_counts.iter().sum::<usize>() > 1000 {
+            println!("JT Mode Distribution [ENTRY_ABS, BASE_ABS, ENTRY_DEL, BASE_DEL]: {:?}", mode_counts);
         }
     }
 
@@ -770,36 +818,66 @@ fn process_jump_tables(
     };
 
     for t in &tables {
+        let anchor_is_base = (t.mode & 0x01) != 0;
+        let use_delta = (t.mode & 0x02) != 0;
+
         let base_va = file_to_va(t.fo as u64).unwrap_or(0);
+
+        let mut prev_norm: u32 = 0;
+        let mut have_prev_norm = false;
 
         for i in 0..t.count {
             let p = t.fo + (i * 4);
-            if p + 4 > out.len() { continue; }
+            if p + 4 > out.len() {
+                continue;
+            }
 
             let entry_va = file_to_va(p as u64).unwrap_or(0);
-            let anchor_va = if t.mode == 0 { entry_va } else { base_va };
+            let anchor_va = if anchor_is_base { base_va } else { entry_va };
 
             if is_compress {
                 let rel = LittleEndian::read_i32(&out[p..p + 4]);
-                let target_va = anchor_va
+                let norm = anchor_va
                     .wrapping_add(rel as i64 as u64)
                     .wrapping_sub(image_base) as u32;
 
-                if use_be {
-                    out[p..p + 4].copy_from_slice(&target_va.to_be_bytes());
+                let enc = if use_delta {
+                    if !have_prev_norm {
+                        have_prev_norm = true;
+                        prev_norm = norm;
+                        norm
+                    } else {
+                        let diff = norm.wrapping_sub(prev_norm) as i32;
+                        prev_norm = norm;
+                        zigzag32(diff)
+                    }
                 } else {
-                    out[p..p + 4].copy_from_slice(&target_va.to_le_bytes());
-                }
+                    norm
+                };
+
+                if use_be { out[p..p + 4].copy_from_slice(&enc.to_be_bytes()); } 
+                else { out[p..p + 4].copy_from_slice(&enc.to_le_bytes()); }
             } else {
-                let norm = if use_be {
-                    u32::from_be_bytes(out[p..p + 4].try_into().unwrap())
+                let enc = if use_be { u32::from_be_bytes(out[p..p + 4].try_into().unwrap()) } 
+                else { LittleEndian::read_u32(&out[p..p + 4]) };
+
+                let norm = if use_delta {
+                    if !have_prev_norm {
+                        have_prev_norm = true;
+                        prev_norm = enc;
+                        enc
+                    } else {
+                        let diff = unzigzag32(enc) as u32;
+                        let v = prev_norm.wrapping_add(diff);
+                        prev_norm = v;
+                        v
+                    }
                 } else {
-                    LittleEndian::read_u32(&out[p..p + 4])
+                    enc
                 };
 
                 let target_va = (norm as u64).wrapping_add(image_base);
                 let orig_rel = target_va.wrapping_sub(anchor_va) as u32;
-
                 LittleEndian::write_u32(&mut out[p..p + 4], orig_rel);
             }
         }
@@ -807,6 +885,7 @@ fn process_jump_tables(
 
     Ok((out, meta_out, tables))
 }
+
 
 
 // ---------------- EH Frame PC-Rel Normalization ----------------
