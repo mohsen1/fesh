@@ -13,6 +13,9 @@ const FORMAT_VERSION: u8 = 5;
 const FUSED_NUM_BLOCK_CAT: usize = CAT_GNUHASH as usize;
 const NUM_FUSED_ORDER: [usize; 12] = [CAT_S2 as usize, CAT_S4 as usize, CAT_S8 as usize, CAT_RELR8 as usize, CAT_S16 as usize, CAT_REL16 as usize, CAT_DYNAMIC16 as usize, CAT_S24 as usize, CAT_RELA24 as usize, CAT_SYM24 as usize, CAT_JT4 as usize, CAT_GNUHASH as usize];
 
+const FUSED_TXT_BLOCK_CAT: usize = CAT_OTHER as usize;
+const TXT_FUSED_ORDER: [usize; 2] = [CAT_STR as usize, CAT_OTHER as usize];
+
 const CAT_OTHER: u8 = 0;
 const CAT_CODE: u8 = 1;
 const CAT_STR: u8 = 2;
@@ -594,10 +597,7 @@ fn process_jump_tables(
     fn zigzag32(v: i32) -> u32 {
         ((v << 1) ^ (v >> 31)) as u32
     }
-    #[inline(always)]
-    fn unzigzag32(z: u32) -> i32 {
-        ((z >> 1) as i32) ^ (-((z & 1) as i32))
-    }
+
 
     #[inline(always)]
     fn jt_score_bytes(v: u32, use_be: bool) -> [u8; 4] {
@@ -1503,11 +1503,19 @@ fn compress_with_mode(file_data: &[u8], use_be: bool) -> Vec<u8> {
     }
 
 
-    let mut num_fused = Vec::new();
+    let fused_cap: usize = NUM_FUSED_ORDER.iter().map(|&c| streams[c].len()).sum();
+    let mut num_fused = Vec::with_capacity(fused_cap);
     for &c in &NUM_FUSED_ORDER {
         num_fused.append(&mut streams[c]);
     }
     streams[FUSED_NUM_BLOCK_CAT] = num_fused;
+    
+    let txt_cap: usize = TXT_FUSED_ORDER.iter().map(|&c| streams[c].len()).sum();
+    let mut txt_fused = Vec::with_capacity(txt_cap);
+    for &c in &TXT_FUSED_ORDER {
+        txt_fused.append(&mut streams[c]);
+    }
+    streams[FUSED_TXT_BLOCK_CAT] = txt_fused;
 
     let blocks: Vec<Block> = streams.into_par_iter().enumerate().map(|(cat, s)| {
         if s.is_empty() { return Block { method: 0, payload: Vec::new() }; }
@@ -1597,6 +1605,7 @@ fn decompress(data: &[u8]) -> Result<Vec<u8>, String> {
 
 
     // Compute cat_lens early to unfuse
+    let mut runs_vec: Vec<(usize, usize)> = Vec::new();
     let mut cat_lens = [0usize; CAT_COUNT];
     {
         let mut rp = 0usize;
@@ -1605,6 +1614,7 @@ fn decompress(data: &[u8]) -> Result<Vec<u8>, String> {
             let cat = (val & 15) as usize;
             let count = (val >> 4) as usize;
             if cat >= CAT_COUNT { return Err("bad category".into()); }
+            runs_vec.push((cat, count));
             cat_lens[cat] = cat_lens[cat].saturating_add(count);
         }
     }
@@ -1631,6 +1641,27 @@ fn decompress(data: &[u8]) -> Result<Vec<u8>, String> {
             decompressed_streams[c] = part;
             total = start;
         }
+        if !fused.is_empty() { return Err("num fused split leftover bytes".into()); }
+    }
+    
+    {
+        let mut fused = std::mem::take(&mut decompressed_streams[FUSED_TXT_BLOCK_CAT]);
+        let mut expected = 0usize;
+        for &c in &TXT_FUSED_ORDER { expected = expected.saturating_add(cat_lens[c]); }
+        if fused.len() != expected {
+            return Err(format!("txt fused stream mismatch: got {} expected {}", fused.len(), expected));
+        }
+
+        let mut total = fused.len();
+        for &c in TXT_FUSED_ORDER.iter().rev() {
+            let len = cat_lens[c];
+            if len > total { return Err("txt fused split underflow".into()); }
+            let start = total - len;
+            let part = fused.split_off(start);
+            decompressed_streams[c] = part;
+            total = start;
+        }
+        if !fused.is_empty() { return Err("txt fused split leftover bytes".into()); }
     }
 
 
@@ -1648,15 +1679,8 @@ fn decompress(data: &[u8]) -> Result<Vec<u8>, String> {
 
     let mut skel = vec![0u8; orig_len];
     let mut cursors = vec![0usize; CAT_COUNT];
-    let mut run_pos = 0usize;
     let mut skel_pos = 0usize;
-
-    while run_pos < runs_data.len() {
-        let val = read_varint(runs_data, &mut run_pos)?;
-        let cat = (val & 15) as usize;
-        let count = (val >> 4) as usize;
-
-        if cat >= CAT_COUNT { return Err("bad category".into()); }
+    for &(cat, count) in &runs_vec {
         if skel_pos + count > skel.len() { return Err("runs exceed output length".into()); }
         let c = cursors[cat];
         if c + count > decompressed_streams[cat].len() { return Err("stream underflow while reconstructing".into()); }
