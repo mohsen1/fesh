@@ -40,10 +40,101 @@ jobs:
     - name: Build FESH
       run: cd fesh_comp && cargo build --release
 
-    - name: Verify Reversibility on System Bash
+    - name: Install dependencies
       run: |
-        cp /bin/bash ./test_bin
-        ./fesh_comp/target/release/fesh_comp compress ./test_bin ./tmp.fes
-        ./fesh_comp/target/release/fesh_comp decompress ./tmp.fes ./test_out
-        cmp -s ./test_bin ./test_out || (echo "Decompression mismatch!" && exit 1)
-        echo "Identity match verified successfully!"
+        sudo apt-get update
+        sudo apt-get install -y curl tar zstd brotli xz-utils python3
+
+    - name: Run 100 Package Massive Benchmark
+      run: |
+        # Download the alpine index
+        mkdir -p massive_bench
+        cd massive_bench
+        curl -sL "https://dl-cdn.alpinelinux.org/alpine/v3.15/main/x86_64/APKINDEX.tar.gz" | tar -xzO APKINDEX > APKINDEX_MAIN || true
+        curl -sL "https://dl-cdn.alpinelinux.org/alpine/v3.15/community/x86_64/APKINDEX.tar.gz" | tar -xzO APKINDEX > APKINDEX_COM || true
+
+        PKGS="gcc binutils bash coreutils curl tar grep sed make nginx redis sqlite jq tmux rsync openssh strace nmap file less tree gawk nano xz zstd brotli python3 git gzip bzip2 lz4 vim perl ruby lua5.3 php8 nodejs cmake ninja flex bison m4 patch findutils diffutils tcpdump lighttpd haproxy mosquitto samba mariadb postgresql ffmpeg imagemagick ghostscript mpv x264 x265 flac lame sox memcached ctags htop dovecot zsh fish llvm12 clang tshark net-snmp ncurses readline util-linux dropbear iperf3 socat mtr sysstat pcre2 libxml2 libxslt openssl gnutls libgcrypt gmp mpfr mpc isl zlib expat libffi pcap dnsmasq chrony openvpn wireguard-tools stunnel iproute2 iputils procps psmisc lsof kmod ethtool bc zip unzip p7zip cpio xz-libs zstd-libs brotli-libs curl-dev wget busybox musl glibc"
+
+        fetch_pkg() {
+            PKG=$1
+            VER=$(grep -A 1 "^P:$PKG\$" APKINDEX_MAIN | grep "^V:" | cut -d":" -f2 | head -n1)
+            REPO="main"
+            if [ -z "$VER" ]; then
+                VER=$(grep -A 1 "^P:$PKG\$" APKINDEX_COM | grep "^V:" | cut -d":" -f2 | head -n1)
+                REPO="community"
+            fi
+            if [ -n "$VER" ]; then
+                URL="https://dl-cdn.alpinelinux.org/alpine/v3.15/$REPO/x86_64/$PKG-$VER.apk"
+                mkdir -p tmp_$PKG
+                curl -sL "$URL" > tmp_$PKG.apk
+                tar -zxf tmp_$PKG.apk -C tmp_$PKG 2>/dev/null || true
+                LARGEST=$(find tmp_$PKG -type f -exec file {} + 2>/dev/null | grep -i "ELF 64-bit" | cut -d":" -f1 | xargs ls -lS 2>/dev/null | head -n1 | awk "{print \$NF}")
+                if [ -n "$LARGEST" ]; then
+                    mv "$LARGEST" "./${PKG}_elf"
+                fi
+                rm -rf tmp_$PKG tmp_$PKG.apk
+            fi
+        }
+
+        echo "Downloading up to 100 packages (running in parallel)..."
+        for pkg in $PKGS; do
+            if [ ! -f "${pkg}_elf" ]; then
+                fetch_pkg "$pkg" &
+                if [[ $(jobs -r -p | wc -l) -ge 25 ]]; then
+                    wait
+                fi
+            fi
+        done
+        wait
+        cd ..
+
+    - name: Execute Strict Reversibility Benchmark Python Wrapper
+      run: |
+        cat << 'PYEOF' > run_bench.py
+        import sys, os, subprocess
+
+        def get_fesh(p):
+            try:
+                subprocess.run(["./fesh_comp/target/release/fesh_comp", "compress", p, p+".fes"], capture_output=True, check=True)
+                sz = os.path.getsize(p+".fes")
+                
+                # STRICT REVERSIBILITY CHECK
+                subprocess.run(["./fesh_comp/target/release/fesh_comp", "decompress", p+".fes", p+".elf.out"], capture_output=True, check=True)
+                
+                orig_data = open(p, "rb").read()
+                dec_data = open(p+".elf.out", "rb").read()
+                
+                os.remove(p+".fes")
+                os.remove(p+".elf.out")
+                
+                if orig_data != dec_data:
+                    print(f"DECOMPRESSION MISMATCH on {p}!!!")
+                    sys.exit(1)
+                    
+                return sz
+            except Exception as e:
+                print(f"Error on {p}: {e}")
+                sys.exit(1)
+
+        files = [f for f in os.listdir("massive_bench") if f.endswith("_elf")]
+        files.sort()
+
+        print(f"--- Running Strict Final Benchmarks on {len(files)} files ---")
+
+        for f in files:
+            p = os.path.join("massive_bench", f)
+            try:
+                data = open(p, "rb").read()
+            except: continue
+            
+            orig = len(data)
+            if orig < 50000: continue
+
+            fesh = get_fesh(p)
+
+            name = f.replace("_elf", "")
+            print(f"Verified {name} (Orig: {orig:,} bytes) - FESH: {fesh:,}")
+
+        print("All exact identity tests PASS!")
+        PYEOF
+        python3 run_bench.py
