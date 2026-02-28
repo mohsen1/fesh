@@ -686,6 +686,13 @@ fn process_eh_frame_hdr(file_data: &[u8], is_compress: bool, use_be: bool) -> Ve
             None => continue,
         };
         
+        if skip_sz == 4 && (eh_frame_ptr_enc == 0x1b || eh_frame_ptr_enc == 0x3b) {
+            let field_fo = file_off + pos;
+            let field_va = sec.address() + pos as u64;
+            let base_va = if eh_frame_ptr_enc == 0x1b { field_va } else { sec.address() };
+            patches.push(EhPatch { fo: field_fo, field_va: base_va });
+        }
+        
         // Patch the eh_frame_ptr field!
         if skip_sz == 4 && (eh_frame_ptr_enc == 0x1b || eh_frame_ptr_enc == 0x3b) {
             let field_fo = file_off + pos;
