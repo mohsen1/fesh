@@ -5,6 +5,7 @@
 
 By deterministically lifting structural mechanics (e.g. Near Branches, RIP-relative addressing, and ELF Relocation structures) into absolute, fixed-width delta domains, `fesh` achieves **zero-metadata exact reversibility** while compressing executable artifacts deeper than standard `xz -9e` and `xz --x86`.
 
+
 ![fesh Top 10 Wins](fesh_chart.png)
 
 ## Architecture
