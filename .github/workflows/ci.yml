@@ -214,7 +214,7 @@ jobs:
         
         By deterministically lifting structural mechanics (e.g. Near Branches, RIP-relative addressing, and ELF Relocation structures) into absolute, fixed-width delta domains, `fesh` achieves **zero-metadata exact reversibility** while compressing executable artifacts deeper than standard `xz -9e` and `xz --x86`.
         
-        ## Architecture
+        ![fesh Top 10 Wins](fesh_chart.png)\n        \n        ## Architecture
         The core engine driving `fesh` has four main pillars:
         
         1. **Big-Endian Image-Relative MoE Mapping:** It disassembles `.text` locally and overwrites relative offsets (`disp32`) with absolute Virtual Addresses globally, then normalizes those addresses relative to the `image_base` of the ELF segment. `fesh` uses a Mixture of Experts (MoE) evaluation gate to convert and test the resulting addresses dynamically into standard Little-Endian or reversed Big-Endian layouts. This leverages LZMA's anchor chaining when high-order stability zeroes are front-loaded against opcodes. It extends this mapping to `.eh_frame_hdr` headers and Jump Table boundaries inside `.rodata`.
