@@ -208,8 +208,7 @@ jobs:
 
         readme = f"""# fesh
 
-`fesh` is an experiment asking AI (ChatGPT Pro and Gemini) blindly to see if they can make a compression library that is more efficient than `xz`. I had no idea how any of this works.
-        > 🚀 **fesh is on average {mean_gain:.1f}% more efficient than `xz -9e --x86` (XZ BCJ) across the top 100 Linux distribution packages.**
+        `fesh` is an experiment asking AI (ChatGPT Pro and Gemini) blindly to see if they can make a compression library that is more efficient than `xz`. I had no idea how any of this works.
         
         `fesh` is a specialized compression pre-processor for x86_64 ELF binaries. It leverages native binary structure to vastly improve traditional LZMA (XZ) dictionary chains.
         
