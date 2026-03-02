@@ -1,6 +1,6 @@
-# FESH Benchmark Results
+# fesh Benchmark Results
 
-| Target | Orig | GZIP | Brotli | ZSTD | XZ BCJ | **FESH** | **Gain** |
+| Target | Orig | GZIP | Brotli | ZSTD | XZ BCJ | **fesh** | **Gain** |
 |:---|---:|---:|---:|---:|---:|---:|---:|
 | `bash` | 742.3KB | 364.3KB (49%) | 312.2KB (42%) | 325.7KB (44%) | 288.3KB (39%) | **265.4KB (36%)** | **-22.9KB (8.0%)** |
 | `bc` | 78.5KB | 36.9KB (47%) | 32.2KB (41%) | 34.3KB (44%) | 30.2KB (38%) | **28.2KB (36%)** | **-1.9KB (6.4%)** |

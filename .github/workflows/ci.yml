@@ -40,7 +40,7 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-cargo-build-target-
 
-    - name: Build FESH
+    - name: Build fesh
       run: cd fesh_comp && cargo build --release
 
     - name: Install dependencies
@@ -125,6 +125,8 @@ jobs:
                 if orig_data != dec_data:
                     print(f"DECOMPRESSION MISMATCH on {p}!!!")
                     sys.exit(1)
+                else:
+                    print(f"[VERIFIED EXACT MATCH] {p}")
                 return sz
             except Exception as e:
                 print(f"Error on {p}: {e}")
@@ -133,7 +135,7 @@ jobs:
         files = [f for f in os.listdir("massive_bench") if f.endswith("_elf")]
         files.sort()
 
-        print(f"--- Running Strict Final Benchmarks on {len(files)} files ---")
+        print(f"--- Running Benchmarks on {len(files)} files ---")
 
         results = []
         import gzip
@@ -164,14 +166,14 @@ jobs:
             name = f.replace("_elf", "")
             row = {"name": name, "orig": orig, "gz": gz, "br": br, "zst": zst, "xz": xz, "bcj": bcj, "fesh": fesh}
             results.append(row)
-            print(f"Verified {name} (Orig: {orig:,} bytes) - FESH: {fesh:,}")
+            print(f"Verified {name} (Orig: {orig:,} bytes) - fesh: {fesh:,}")
 
         def format_size(size_bytes):
             if size_bytes < 1024: return f"{size_bytes:.0f}B"
             elif size_bytes < 1024 * 1024: return f"{size_bytes / 1024:.1f}KB"
             else: return f"{size_bytes / (1024 * 1024):.2f}MB"
 
-        table = "| Target | Orig | GZIP | Brotli | ZSTD | XZ BCJ | **FESH** | **Gain** |\n"
+        table = "| Target | Orig | GZIP | Brotli | ZSTD | XZ BCJ | **fesh** | **Gain** |\n"
         table += "|:---|---:|---:|---:|---:|---:|---:|---:|\n"
 
         fesh_wins = 0
@@ -182,9 +184,9 @@ jobs:
             orig = r["orig"]
             gz, br, zst, bcj, fesh = r["gz"], r["br"], r["zst"], r["bcj"], r["fesh"]
             
-            sizes = {"GZIP": gz, "Brotli": br, "ZSTD": zst, "XZ BCJ": bcj, "FESH": fesh}
+            sizes = {"GZIP": gz, "Brotli": br, "ZSTD": zst, "XZ BCJ": bcj, "fesh": fesh}
             winner_name = min(sizes, key=sizes.get)
-            if winner_name == "FESH": fesh_wins += 1
+            if winner_name == "fesh": fesh_wins += 1
             
             diff_bytes = fesh - bcj
             pct = abs(diff_bytes / bcj) * 100
@@ -200,24 +202,26 @@ jobs:
                 s = f"{format_size(val)} ({(val/orig)*100:.0f}%)"
                 return f"**{s}**" if name == winner_name else s
 
-            table += f"| `{r['name']}` | {format_size(orig)} | {fmt_col(gz, 'GZIP')} | {fmt_col(br, 'Brotli')} | {fmt_col(zst, 'ZSTD')} | {fmt_col(bcj, 'XZ BCJ')} | {fmt_col(fesh, 'FESH')} | {gain} |\n"
+            table += f"| `{r['name']}` | {format_size(orig)} | {fmt_col(gz, 'GZIP')} | {fmt_col(br, 'Brotli')} | {fmt_col(zst, 'ZSTD')} | {fmt_col(bcj, 'XZ BCJ')} | {fmt_col(fesh, 'fesh')} | {gain} |\n"
 
         mean_gain = total_fesh_gain_pct / total if total > 0 else 0.0
 
-        readme = f"""# FESH (Fast ELF Semantic Heuristics)
-        > 🚀 **FESH is on average {mean_gain:.1f}% more efficient than `xz -9e --x86` (XZ BCJ) across the top 100 Linux distribution packages.**
+        readme = f"""# fesh
+
+`fesh` is an experiment asking AI (ChatGPT Pro and Gemini) blindly to see if they can make a compression library that is more efficient than `xz`. I had no idea how any of this works.
+        > 🚀 **fesh is on average {mean_gain:.1f}% more efficient than `xz -9e --x86` (XZ BCJ) across the top 100 Linux distribution packages.**
         
-        FESH is a specialized compression pre-processor for x86_64 ELF binaries. It leverages native binary structure to vastly improve traditional LZMA (XZ) dictionary chains.
+        `fesh` is a specialized compression pre-processor for x86_64 ELF binaries. It leverages native binary structure to vastly improve traditional LZMA (XZ) dictionary chains.
         
-        By deterministically lifting structural mechanics (e.g. Near Branches, RIP-relative addressing, and ELF Relocation structures) into absolute, fixed-width delta domains, FESH achieves **zero-metadata exact reversibility** while compressing executable artifacts deeper than standard `xz -9e` and `xz --x86`.
+        By deterministically lifting structural mechanics (e.g. Near Branches, RIP-relative addressing, and ELF Relocation structures) into absolute, fixed-width delta domains, `fesh` achieves **zero-metadata exact reversibility** while compressing executable artifacts deeper than standard `xz -9e` and `xz --x86`.
         
-        ## Architecture: USASE vH
-        **USASE** (Unified Semantic Address Space Extraction) is the core engine driving FESH. It has four main pillars:
+        ## Architecture
+        The core engine driving `fesh` has four main pillars:
         
-        1. **Big-Endian Image-Relative MoE Mapping:** It disassembles `.text` locally and overwrites relative offsets (`disp32`) with absolute Virtual Addresses globally, then normalizes those addresses relative to the exact `image_base` of the ELF segment! FESH uses a Mixture of Experts (MoE) evaluation gate to convert and test the resulting addresses dynamically into standard Little-Endian or reversed Big-Endian layouts, capitalizing on LZMA's anchor chaining when high-order stability zeroes are front-loaded directly against the `E8/E9` opcodes. It natively extends this exact same Image-Relative Absolute Mapping to `.eh_frame_hdr` headers and heuristic Jump Table boundaries inside `.rodata`!
-        2. **16-Stream Entropy Separation:** It rips the transformed execution skeleton into natively disjoint semantic pipes (e.g., Code, Strings, `.eh_frame`, `.rela`, `.dynamic`, `Jump Tables`). These chunks exhibit drastically different Shannon characteristics. LZMA models each boundary independently in parallel, generating tightly packed dictionaries without cross-pollution. To prevent LZMA from over-modeling random numeric permutations, parameter vectors strictly assign `lzma_literal_context_bits = 0` and natively exclude XZ streams on absent boundaries via the RAW method flag.
-        3. **In-Place ZigZag Struct Deltas:** Complex ELF table structures (like `.rela.dyn`, `.symtab`, `.relr`, and `.dynamic`) contain massive structs. Instead of generic shuffling, FESH precisely targets individual struct fields based strictly on the ELF spec (`r_offset`, `r_addend`, `st_size`) and performs in-place column-wise delta mathematics. FESH utilizes `ZigZag` encoders to prevent signed 64-bit deltas (like jumping backwards in memory) from bleeding `0xFF` trails across the sequence. 
-        4. **Field-Endian Pre-Transpose:** Instead of standard matrix un-interleaving across raw struct streams, FESH forces each data column into Big-Endian representations *before* executing the final byte shuffle. This forces zero-padding bytes of 64-bit fields to completely saturate the first layers of the matrix, turning sequential pointer arrays into ultra-dense 0x00 vectors for XZ's range coders.
+        1. **Big-Endian Image-Relative MoE Mapping:** It disassembles `.text` locally and overwrites relative offsets (`disp32`) with absolute Virtual Addresses globally, then normalizes those addresses relative to the `image_base` of the ELF segment. `fesh` uses a Mixture of Experts (MoE) evaluation gate to convert and test the resulting addresses dynamically into standard Little-Endian or reversed Big-Endian layouts. This leverages LZMA's anchor chaining when high-order stability zeroes are front-loaded against opcodes. It extends this mapping to `.eh_frame_hdr` headers and Jump Table boundaries inside `.rodata`.
+        2. **16-Stream Entropy Separation:** It separates the transformed execution skeleton into disjoint semantic pipes (e.g., Code, Strings, `.eh_frame`, `.rela`, `.dynamic`, `Jump Tables`). LZMA models each boundary independently in parallel. Parameter vectors assign `lzma_literal_context_bits = 0` for these structures, and empty streams are excluded via a RAW method flag.
+        3. **In-Place ZigZag Struct Deltas:** Complex ELF table structures (like `.rela.dyn`, `.symtab`, `.relr`, and `.dynamic`) undergo in-place column-wise delta mathematics based on the ELF spec (`r_offset`, `r_addend`, `st_size`). `ZigZag` encoders are used to prevent signed 64-bit deltas from bleeding `0xFF` trails across the sequence. 
+        4. **Field-Endian Pre-Transpose:** `fesh` forces each data column into Big-Endian representations before executing the final byte shuffle, grouping zero-padding bytes of 64-bit fields together.
         
         ## Build
         
@@ -238,21 +242,21 @@ jobs:
         ./target/release/fesh_comp decompress <input.fes> <output_elf>
         ```
         
-        ## 100-Package Massive Benchmark
+        ## 100-Package Benchmark
         
-        To definitively prove FESH is the absolute #1 algorithm for Linux package distribution binaries, we dynamically downloaded and benchmarked it against {total} of the most popular application binaries from Alpine Repositories across 6 major compression configurations (`GZIP`, `Brotli -11`, `ZSTD -19`, `XZ -9e`, `XZ -9e + BCJ`, and `FESH`). 
+        The following benchmarks were generated by downloading {total} application binaries from Alpine Repositories across 6 major compression configurations (`GZIP`, `Brotli -11`, `ZSTD -19`, `XZ -9e`, `XZ -9e + BCJ`, and `fesh`). 
         
-        Every single benchmark strictly enforces decompression validation to mathematically prove exact artifact reproduction bit-by-bit!
+        Every benchmark enforces decompression validation to ensure exact reproduction.
         
-        FESH won **{fesh_wins} out of {total}** benchmarks, establishing a new state-of-the-art compression ceiling for executable artifacts globally.
+        `fesh` had the smallest size in **{fesh_wins} out of {total}** tests. 
 
         Full benchmark details are in [BENCHMARK.md](BENCHMARK.md).
         
-        *(Note: Tiny binaries under 50KB were excluded as container headers dominate small files. FESH executes native compression transparently within ~150ms per binary via Rayon).*
+        *(Note: Binaries under 50KB were excluded. `fesh` executes within ~150ms per binary via Rayon).*
         """
 
         with open("BENCHMARK.md", "w") as f:
-            f.write("# FESH Benchmark Results\n\n")
+            f.write("# fesh Benchmark Results\n\n")
             f.write(table)
 
         with open("README.md", "w") as f:
