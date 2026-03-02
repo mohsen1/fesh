@@ -254,6 +254,7 @@ jobs:
         *(Note: Binaries under 50KB were excluded. `fesh` executes within ~150ms per binary via Rayon).*
         """
 
+        readme = readme.replace('\n        ', '\n')
         with open("BENCHMARK.md", "w") as f:
             f.write("# fesh Benchmark Results\n\n")
             f.write(table)
